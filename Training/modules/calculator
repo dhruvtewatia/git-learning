@@ -1032,28 +1032,40 @@ Trade-offs to know about vs. sections 2/6:
 <#assign interestRateUploadLocalService = serviceLocator.findService("com.sbi.core.service.service.InterestRateUploadLocalService")>
 <#assign countryCode = (configuration.country)!"IN">
 <#assign customerCategories = ["NORMAL", "SENIOR_CITIZEN", "CORPORATE"]>
-<#assign allRates = []>
-<#list customerCategories as category>
-	<#assign categoryRates = interestRateUploadLocalService.findByIsActiveStatusCountryNCategory(true, "ACTIVE", countryCode, category)>
-	<#list categoryRates as rate>
-		<#assign allRates = allRates + [rate]>
-	</#list>
-</#list>
 
 <div class="deposit-calculator" data-fragment-namespace="${fragmentEntryLinkId}">
 
 	<#-- SSR-embedded rate data: application/json so it's inert until the
 	     fragment's own JS explicitly JSON.parses it — never executed as a
-	     script, unlike a bare `var DEPOSIT_RATES = [...]` global. -->
+	     script, unlike a bare `var DEPOSIT_RATES = [...]` global.
+
+	     Single pass, not accumulate-into-a-list-then-reloop: the earlier
+	     two-phase version (build `allRates` via `<#assign allRates =
+	     allRates + [rate]>` inside a nested loop, then `<#list allRates as
+	     rate>` separately) is what produced "rate has evaluated to null or
+	     missing" here — whether from FreeMarker's own list-reassignment
+	     semantics or a null element coming back from the persistence
+	     finder, avoiding the two-phase pattern and guarding each element
+	     with `rate??` sidesteps it either way. `!""`/`!0` defaults on the
+	     individual fields are the same null-safety FreeMarker's error
+	     message itself suggests. -->
 	<script type="application/json" data-output="ratesData">
 [
-<#list allRates as rate>
-	{
-		"category": "${rate.category?js_string}",
-		"interestType": "${rate.interestType?js_string}",
-		"interestRate": ${rate.interestRate?c},
-		"status": "${rate.status?js_string}"
-	}<#if rate_has_next>,</#if>
+<#assign isFirstRate = true>
+<#list customerCategories as category>
+	<#assign categoryRates = (interestRateUploadLocalService.findByIsActiveStatusCountryNCategory(true, "ACTIVE", countryCode, category))![]>
+	<#list categoryRates as rate>
+		<#if rate??>
+			<#if !isFirstRate>,</#if>
+			<#assign isFirstRate = false>
+			{
+				"category": "${(rate.category!"")?js_string}",
+				"interestType": "${(rate.interestType!"")?js_string}",
+				"interestRate": ${(rate.interestRate!0)?c},
+				"status": "${(rate.status!"")?js_string}"
+			}
+		</#if>
+	</#list>
 </#list>
 ]
 	</script>
