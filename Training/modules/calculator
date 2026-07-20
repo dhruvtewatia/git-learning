@@ -956,3 +956,559 @@ function fetchApplicableRateForCalculator(customerType, interestType) {
 -- configuration.json addition: add a "country" text field (defaultValue "IN")
 -- alongside restApplicationPath if your rate table is multi-country; drop it
 -- if country is always fixed and hardcode it in the two calls above instead.
+
+--------------------------------------------------------------------------------
+7. LOCAL SERVICE VIA FREEMARKER — SSR-embedded rates, zero client-side calls
+--------------------------------------------------------------------------------
+Sidesteps jsonws entirely: rates are fetched once, server-side, by the local
+service when the fragment renders, then embedded as JSON in the page. All
+client-side behavior (category/product select, calculate, rates table)
+reads that embedded data — no fetch(), no REST Builder module, no jsonws
+allowlist to fight with.
+
+Trade-offs to know about vs. sections 2/6:
+  - Rates are frozen at render time. If this page ever sits behind
+    full-page/fragment caching, a rate change won't show until the cache
+    entry expires/is busted — fine for a rate card that changes rarely, but
+    worth knowing.
+  - 3 local-service calls happen per render (one per customer category) to
+    build the full embedded set — cheap in-JVM calls, not a network concern,
+    but still real DB work on every render unless the local service itself
+    caches (see the PortalCache note in section 2).
+  - serviceLocator is one of FreeMarker's "restricted" context variables in
+    Liferay — available to trusted template contexts (ADTs, and Fragments
+    when the editing role has that trust), but some hardened instances lock
+    it down further for Fragment authors specifically. If ${serviceLocator}
+    resolves to nothing / errors out here, check your instance's FreeMarker
+    restricted-variables configuration or the permissions on the role
+    editing this fragment — this is a separate setting from the jsonws
+    context-allowlist you were just chasing.
+
+--- add to InterestRateUploadLocalServiceImpl.java (package com.sbi.core.service.service.impl) ---
+-- mirrors the remote method from section 6, but on the *LocalServiceImpl* so
+-- serviceLocator.findService(...InterestRateUploadLocalService) can reach it
+-- without going through the remote/jsonws layer at all.
+
+	public List<InterestRateUpload> findByIsActiveStatusCountryNCategory(
+			boolean isActive, String status, String country, String category) {
+
+		return interestRateUploadPersistence.findByIsActiveNStatusNCountryNCategory(
+			isActive, status, country, category);
+	}
+
+-- Rerun Service Builder after adding this so InterestRateUploadLocalService /
+-- InterestRateUploadLocalServiceUtil get regenerated with the new method.
+
+--- fragment.json (unchanged from section 3) -----------------------------------
+{
+	"cssPath": "index.css",
+	"htmlPath": "index.html",
+	"jsPath": "index.js",
+	"configurationPath": "configuration.json",
+	"name": "Deposit Calculator",
+	"type": "component"
+}
+
+--- configuration.json ----------------------------------------------------------
+{
+	"fieldSets": [
+		{
+			"fields": [
+				{
+					"name": "country",
+					"label": "Country code for the rate lookup",
+					"type": "text",
+					"defaultValue": "IN"
+				}
+			]
+		}
+	]
+}
+
+--- index.html (FreeMarker + markup, full file) --------------------------------
+<#-- Fragment HTML executes as a FreeMarker template in Liferay, so this
+     server-side block runs once per render, before any of the markup below
+     reaches the browser. -->
+<#assign interestRateUploadLocalService = serviceLocator.findService("com.sbi.core.service.service.InterestRateUploadLocalService")>
+<#assign countryCode = (configuration.country)!"IN">
+<#assign customerCategories = ["NORMAL", "SENIOR_CITIZEN", "CORPORATE"]>
+<#assign allRates = []>
+<#list customerCategories as category>
+	<#assign categoryRates = interestRateUploadLocalService.findByIsActiveStatusCountryNCategory(true, "ACTIVE", countryCode, category)>
+	<#list categoryRates as rate>
+		<#assign allRates = allRates + [rate]>
+	</#list>
+</#list>
+
+<div class="deposit-calculator" data-fragment-namespace="${fragmentEntryLinkId}">
+
+	<#-- SSR-embedded rate data: application/json so it's inert until the
+	     fragment's own JS explicitly JSON.parses it — never executed as a
+	     script, unlike a bare `var DEPOSIT_RATES = [...]` global. -->
+	<script type="application/json" data-output="ratesData">
+[
+<#list allRates as rate>
+	{
+		"category": "${rate.category?js_string}",
+		"interestType": "${rate.interestType?js_string}",
+		"interestRate": ${rate.interestRate?c},
+		"status": "${rate.status?js_string}"
+	}<#if rate_has_next>,</#if>
+</#list>
+]
+	</script>
+
+	<h2 class="dc-title">Deposit Calculator</h2>
+
+	<div class="dc-row">
+		<label class="dc-label">Type of Customer *</label>
+		<div class="dc-radio-group" data-field="customerType">
+		<#list customerCategories as category>
+			<label>
+				<input type="radio" name="customerType" value="${category?html}"<#if category_index == 0> checked</#if>>
+				${category?replace("_", " ")?capitalize}
+			</label>
+		</#list>
+		</div>
+	</div>
+
+	<div class="dc-row">
+		<label class="dc-label" for="dc-interest-type">Please select the product *</label>
+		<select id="dc-interest-type" class="dc-input" data-field="interestType"></select>
+	</div>
+
+	<div class="dc-row">
+		<label class="dc-label">Tenure *</label>
+		<div class="dc-tenure-group">
+			<input type="number" class="dc-input" data-field="tenureYears" min="0" max="10" value="0" placeholder="Years">
+			<input type="number" class="dc-input" data-field="tenureMonths" min="0" max="12" value="0" placeholder="Months">
+			<input type="number" class="dc-input" data-field="tenureDays" min="0" max="31" value="0" placeholder="Days">
+		</div>
+	</div>
+
+	<div class="dc-row">
+		<label class="dc-label" for="dc-amount">How much amount do you want to invest? *</label>
+		<input id="dc-amount" type="number" class="dc-input" data-field="amount"
+			min="10000" max="999999" placeholder="Min 10,000 / Max 9,99,999">
+	</div>
+
+	<div class="dc-row">
+		<label class="dc-label">When would you like to receive the interest? *</label>
+		<div class="dc-radio-group" data-field="payoutFrequency">
+			<label><input type="radio" name="payoutFrequency" value="MONTHLY" disabled> Monthly</label>
+			<label><input type="radio" name="payoutFrequency" value="QUARTERLY" disabled> Quarterly</label>
+			<label><input type="radio" name="payoutFrequency" value="ANNUALLY" disabled> Annually</label>
+			<label><input type="radio" name="payoutFrequency" value="MATURITY" checked> On Maturity</label>
+		</div>
+	</div>
+
+	<p class="dc-error" data-field="error" hidden></p>
+
+	<button type="button" class="dc-calculate-btn" data-action="calculate">Calculate</button>
+
+	<div class="dc-results">
+		<h3>Maturity &amp; Details</h3>
+		<div class="dc-card">
+			<span class="dc-card-label">Maturity Amount (Principal + Interest)</span>
+			<span class="dc-card-value" data-output="maturityAmount">-</span>
+		</div>
+		<div class="dc-card">
+			<span class="dc-card-label">Total Interest Amount (Accumulated)</span>
+			<span class="dc-card-value" data-output="interestAmount">-</span>
+		</div>
+		<div class="dc-card">
+			<span class="dc-card-label">Interest Rate</span>
+			<span class="dc-card-value" data-output="interestRate">-</span>
+		</div>
+		<div class="dc-card">
+			<span class="dc-card-label">Interest Payout Amount (Monthly / Quarterly / Annually / On Maturity)</span>
+			<span class="dc-card-value" data-output="payoutAmount">-</span>
+		</div>
+	</div>
+
+	<div class="dc-row">
+		<button type="button" class="dc-secondary-btn" data-action="view-rates">View current interest rates</button>
+	</div>
+
+	<table class="dc-rates-table" data-output="ratesTable" hidden>
+		<thead>
+			<tr>
+				<th>Category</th>
+				<th>Interest Type</th>
+				<th>Rate</th>
+				<th>Status</th>
+			</tr>
+		</thead>
+		<tbody data-output="ratesTableBody"></tbody>
+	</table>
+
+	<p class="dc-disclaimer">*Maturity amount shown here is indicative only. Rates reflect the page's last render.</p>
+</div>
+
+--- index.css (full file) -------------------------------------------------------
+.deposit-calculator { max-width: 640px; font-family: inherit; }
+.dc-title { margin-bottom: 16px; }
+.dc-row { margin-bottom: 14px; }
+.dc-label { display: block; font-weight: 600; margin-bottom: 6px; }
+.dc-input {
+	width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px;
+	box-sizing: border-box;
+}
+.dc-tenure-group { display: flex; gap: 8px; }
+.dc-radio-group { display: flex; gap: 16px; flex-wrap: wrap; }
+.dc-radio-group label { display: flex; align-items: center; gap: 6px; }
+.dc-radio-group input:disabled + * { color: #999; }
+.dc-error { color: #b00020; }
+.dc-calculate-btn {
+	background: #1a1a6c; color: #fff; border: none; border-radius: 6px;
+	padding: 10px 24px; font-weight: 600; cursor: pointer;
+}
+.dc-calculate-btn:hover { background: #101050; }
+.dc-secondary-btn {
+	background: #fff; color: #1a1a6c; border: 1px solid #1a1a6c;
+	border-radius: 6px; padding: 8px 20px; font-weight: 600; cursor: pointer;
+}
+.dc-secondary-btn:hover { background: #f0f0fa; }
+.dc-results { margin-top: 24px; }
+.dc-card {
+	background: #1a1a6c; color: #fff; border-radius: 8px; padding: 14px 16px;
+	margin-bottom: 10px; display: flex; flex-direction: column; gap: 4px;
+}
+.dc-card-label { font-size: 0.85rem; opacity: 0.85; }
+.dc-card-value { font-size: 1.25rem; font-weight: 700; }
+.dc-rates-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+.dc-rates-table th, .dc-rates-table td {
+	text-align: left; padding: 8px 10px; border-bottom: 1px solid #ddd;
+}
+.dc-rates-table th { background: #f5f5f5; font-size: 0.85rem; }
+.dc-disclaimer { font-size: 0.75rem; color: #777; margin-top: 12px; }
+
+--- index.js (full file) ---------------------------------------------------------
+// Liferay Fragment JS runs with `fragmentElement` and `configuration` already
+// in scope. Every rate this file needs was embedded server-side by the FTL
+// block in index.html, so there is no fetch()/Promise/retry code here at all.
+
+(function initDepositCalculator(root) {
+	if (!root) {
+		return;
+	}
+
+	var rates = [];
+	var ratesDataEl = root.querySelector('[data-output="ratesData"]');
+
+	try {
+		rates = ratesDataEl ? JSON.parse(ratesDataEl.textContent) : [];
+	}
+	catch (err) {
+		/* eslint-disable-next-line no-console */
+		console.error('Could not parse embedded rate data', err);
+	}
+
+	var interestTypeSelect = root.querySelector('[data-field="interestType"]');
+	var payoutRadios = root.querySelectorAll('input[name="payoutFrequency"]');
+	var errorEl = root.querySelector('[data-field="error"]');
+	var calculateBtn = root.querySelector('[data-action="calculate"]');
+	var viewRatesBtn = root.querySelector('[data-action="view-rates"]');
+	var ratesTable = root.querySelector('[data-output="ratesTable"]');
+
+	function getSelectedCategory() {
+		var checked = root.querySelector('input[name="customerType"]:checked');
+
+		return checked ? checked.value : null;
+	}
+
+	function getRatesForCategory(category) {
+		return rates.filter(function(rate) {
+			return rate.category === category;
+		});
+	}
+
+	function findSelectedRate() {
+		var category = getSelectedCategory();
+		var interestType = interestTypeSelect.value;
+
+		return rates.filter(function(rate) {
+			return rate.category === category && rate.interestType === interestType;
+		})[0] || null;
+	}
+
+	function setOutput(field, value) {
+		var el = root.querySelector('[data-output="' + field + '"]');
+
+		if (el) {
+			el.textContent = value;
+		}
+	}
+
+	function updateSelectedRateDisplay() {
+		var rate = findSelectedRate();
+
+		setOutput('interestRate', rate ? rate.interestRate.toFixed(2) + '%' : '-');
+	}
+
+	function populateInterestTypes() {
+		var previousValue = interestTypeSelect.value;
+		var options = getRatesForCategory(getSelectedCategory());
+
+		interestTypeSelect.innerHTML = '';
+
+		options.forEach(function(rate) {
+			var optionEl = document.createElement('option');
+
+			optionEl.value = rate.interestType;
+			optionEl.textContent = rate.interestType + ' (' + rate.interestRate.toFixed(2) + '%)';
+
+			interestTypeSelect.appendChild(optionEl);
+		});
+
+		if (options.some(function(rate) { return rate.interestType === previousValue; })) {
+			interestTypeSelect.value = previousValue;
+		}
+
+		updateSelectedRateDisplay();
+	}
+
+	function showError(message) {
+		if (!errorEl) {
+			return;
+		}
+		errorEl.textContent = message;
+		errorEl.hidden = !message;
+	}
+
+	function formatCurrency(amount) {
+		return '₹' + amount.toFixed(2);
+	}
+
+	function getTenureDays() {
+		var years = Number(root.querySelector('[data-field="tenureYears"]').value) || 0;
+		var months = Number(root.querySelector('[data-field="tenureMonths"]').value) || 0;
+		var days = Number(root.querySelector('[data-field="tenureDays"]').value) || 0;
+
+		return Math.round(years * 365 + months * 30 + days);
+	}
+
+	function getTenureYearsDecimal() {
+		var years = Number(root.querySelector('[data-field="tenureYears"]').value) || 0;
+		var months = Number(root.querySelector('[data-field="tenureMonths"]').value) || 0;
+		var days = Number(root.querySelector('[data-field="tenureDays"]').value) || 0;
+
+		// Annexure 4 tenure conversion: years stay as-is, months/12, days/365.
+		return years + (months / 12) + (days / 365);
+	}
+
+	// Field-table rule: which payout options are legal for a given tenure.
+	function getAvailablePayoutFrequencies(totalDays) {
+		if (totalDays < 30) {
+			return ['MATURITY'];
+		}
+		if (totalDays < 90) {
+			return ['MONTHLY', 'MATURITY'];
+		}
+		if (totalDays < 365) {
+			return ['MONTHLY', 'QUARTERLY', 'MATURITY'];
+		}
+		return ['MONTHLY', 'QUARTERLY', 'ANNUALLY', 'MATURITY'];
+	}
+
+	function updatePayoutOptions() {
+		var available = getAvailablePayoutFrequencies(getTenureDays());
+
+		payoutRadios.forEach(function(radio) {
+			var isAvailable = available.indexOf(radio.value) !== -1;
+
+			radio.disabled = !isAvailable;
+
+			if (radio.checked && !isAvailable) {
+				radio.checked = false;
+			}
+		});
+
+		var anyChecked = Array.prototype.some.call(payoutRadios, function(r) {
+			return r.checked;
+		});
+
+		if (!anyChecked) {
+			var maturityRadio = root.querySelector('input[value="MATURITY"]');
+
+			if (maturityRadio) {
+				maturityRadio.checked = true;
+			}
+		}
+	}
+
+	// Annexure 4: A = P x (1 + r/n)^(n x t), n fixed at 4 (quarterly).
+	function calculateMaturity(principal, ratePct, tenureYears) {
+		var n = 4;
+		var r = ratePct / 100;
+
+		return principal * Math.pow(1 + r / n, n * tenureYears);
+	}
+
+	// Per-year payout for Annually: quarterly compounding within the year,
+	// principal resets each year since the payout removes that year's
+	// interest rather than reinvesting it.
+	function calculateAnnualPayoutPerYear(principal, ratePct) {
+		var n = 4;
+		var r = ratePct / 100;
+
+		return principal * (Math.pow(1 + r / n, n) - 1);
+	}
+
+	function calculateAnnualRemainderAtMaturity(principal, ratePct, tenureYears) {
+		var n = 4;
+		var r = ratePct / 100;
+		var remainderYears = tenureYears - Math.floor(tenureYears);
+
+		if (remainderYears <= 0) {
+			return 0;
+		}
+
+		return principal * (Math.pow(1 + r / n, n * remainderYears) - 1);
+	}
+
+	function calculatePayoutAmount(payoutFrequency, principal, ratePct, tenureYears, totalInterest) {
+		var totalMonths = tenureYears * 12;
+
+		switch (payoutFrequency) {
+			case 'QUARTERLY':
+				// flat non-cumulative quarterly interest, per Annexure 4 example
+				// (100000 @ 8% => 100000*0.08/4 = 2000/quarter)
+				return principal * (ratePct / 100) / 4;
+
+			case 'MONTHLY':
+				// total compounded interest spread evenly across the tenure,
+				// per Annexure 4 example (8243 / 12 months ~= 687/month)
+				return totalMonths > 0 ? totalInterest / totalMonths : 0;
+
+			case 'ANNUALLY':
+				return calculateAnnualPayoutPerYear(principal, ratePct);
+
+			case 'MATURITY':
+			default:
+				return totalInterest;
+		}
+	}
+
+	function validate(principal, tenureDays, rate) {
+		if (!principal || principal < 10000 || principal > 999999) {
+			return 'Amount must be between ₹10,000 and ₹9,99,999.';
+		}
+		if (tenureDays <= 0) {
+			return 'Please enter a valid tenure.';
+		}
+		if (!rate) {
+			return 'No active rate found for this selection.';
+		}
+		return null;
+	}
+
+	function handleCalculate() {
+		showError('');
+
+		var principal = Number(root.querySelector('[data-field="amount"]').value);
+		var tenureDays = getTenureDays();
+		var tenureYears = getTenureYearsDecimal();
+		var payoutFrequency = root.querySelector('input[name="payoutFrequency"]:checked').value;
+		var rate = findSelectedRate();
+
+		var validationError = validate(principal, tenureDays, rate);
+
+		if (validationError) {
+			showError(validationError);
+			return;
+		}
+
+		var maturityAmount = calculateMaturity(principal, rate.interestRate, tenureYears);
+		var totalInterest = maturityAmount - principal;
+		var payoutAmount = calculatePayoutAmount(
+			payoutFrequency, principal, rate.interestRate, tenureYears, totalInterest);
+
+		setOutput('maturityAmount', formatCurrency(maturityAmount));
+		setOutput('interestAmount', formatCurrency(totalInterest));
+
+		if (payoutFrequency === 'ANNUALLY') {
+			var remainder = calculateAnnualRemainderAtMaturity(principal, rate.interestRate, tenureYears);
+
+			setOutput('payoutAmount', formatCurrency(payoutAmount) + '/year' +
+				(remainder > 0 ? ' (+ ' + formatCurrency(remainder) + ' at maturity for the part-year)' : ''));
+		}
+		else {
+			setOutput('payoutAmount', formatCurrency(payoutAmount));
+		}
+	}
+
+	// textContent, not innerHTML — defense in depth even though this data
+	// came from our own SSR block, in case the entity ever grows a
+	// free-text field editable outside a strict enum.
+	function renderRatesTable() {
+		var tbody = root.querySelector('[data-output="ratesTableBody"]');
+
+		if (!tbody) {
+			return;
+		}
+
+		tbody.innerHTML = '';
+
+		rates.forEach(function(rate) {
+			var tr = document.createElement('tr');
+
+			[
+				rate.category,
+				rate.interestType,
+				rate.interestRate.toFixed(2) + '%',
+				rate.status
+			].forEach(function(value) {
+				var td = document.createElement('td');
+
+				td.textContent = value;
+				tr.appendChild(td);
+			});
+
+			tbody.appendChild(tr);
+		});
+	}
+
+	// -- wiring --
+	renderRatesTable();
+	populateInterestTypes();
+	updatePayoutOptions();
+
+	root.querySelectorAll('input[name="customerType"]').forEach(function(radio) {
+		radio.addEventListener('change', populateInterestTypes);
+	});
+
+	interestTypeSelect.addEventListener('change', updateSelectedRateDisplay);
+
+	['tenureYears', 'tenureMonths', 'tenureDays'].forEach(function(field) {
+		root.querySelector('[data-field="' + field + '"]').addEventListener('input', updatePayoutOptions);
+	});
+
+	if (viewRatesBtn && ratesTable) {
+		viewRatesBtn.addEventListener('click', function() {
+			ratesTable.hidden = !ratesTable.hidden;
+			viewRatesBtn.textContent = ratesTable.hidden ?
+				'View current interest rates' : 'Hide current interest rates';
+		});
+	}
+
+	calculateBtn.addEventListener('click', handleCalculate);
+})(fragmentElement.querySelector('.deposit-calculator'));
+
+--------------------------------------------------------------------------------
+8. NOTE ON THE FIELD MODEL — please confirm
+--------------------------------------------------------------------------------
+Sections 1-6 assumed a fictional customerType/productCode/tenureDays rate
+model before the real InterestRateUploadServiceImpl methods were shared.
+This section builds on the real confirmed fields (category, country,
+interestType, interestRate, status) and deliberately decouples them from
+tenure: tenure (Years/Months/Days) here is used only for the Annexure 4
+compounding math (t in A = P(1+r/4)^4t), while the rate itself is selected
+by category + interestType. That assumes interestType represents a
+product/plan choice (e.g. TDR/STDR/RD) rather than a tenure bucket — if
+InterestRateUpload actually has separate tenure-range columns (as the
+original field-table spec implies rates should vary by tenure), those need
+adding to the query/embedded JSON and to findSelectedRate()'s matching
+logic; I don't have visibility into the entity's full column list beyond
+what's shown in the two method signatures, so this is worth confirming
+against the actual service.xml before treating section 7 as final.
