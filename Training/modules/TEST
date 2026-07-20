@@ -14,12 +14,14 @@ Service Builder directly — it calls a REST Builder resource, because:
   - versioned path (/v1.0/...) so the fragment doesn't break on service changes
 
   [deposit-calculator fragment]
-          | fetch() GET, once per tenure/customer-type change (not per keystroke)
+          | fetch() GET /products once on load, GET /interest-rates once per
+          | tenure/customer-type change (not per keystroke)
           v
-  [deposit-rate-rest]  /o/deposit-rate/v1.0/interest-rates
+  [deposit-rate-rest]  /o/deposit-rate/v1.0/{interest-rates,products}
           | InterestRateLocalServiceUtil.findByCustomerType_Product_Tenure(...)
+          | DepositProductLocalServiceUtil.findByActive(true)
           v
-  [deposit-rate-service]  InterestRate entity (Service Builder)
+  [deposit-rate-service]  InterestRate + DepositProduct entities (Service Builder)
 
 Section 4 shows the lighter-weight alternative (@JSONWebService + Liferay.Service)
 in case the extra REST module isn't worth it for your setup.
@@ -63,6 +65,26 @@ in case the extra REST module isn't worth it for your setup.
 		<finder name="C_P_Active" return-type="Collection">
 			<finder-column name="customerType" />
 			<finder-column name="productCode" />
+			<finder-column name="active" />
+		</finder>
+	</entity>
+
+	<entity name="DepositProduct" local-service="true" remote-service="false">
+		<column name="productId" type="long" primary="true" />
+		<column name="companyId" type="long" />
+		<column name="groupId" type="long" />
+		<column name="createDate" type="Date" />
+		<column name="modifiedDate" type="Date" />
+
+		<column name="productCode" type="String" />
+		<column name="productName" type="String" />
+		<column name="active" type="boolean" />
+
+		<order by="asc">
+			<order-column name="productName" />
+		</order>
+
+		<finder name="Active" return-type="Collection">
 			<finder-column name="active" />
 		</finder>
 	</entity>
@@ -159,6 +181,16 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/InterestRate" }
+  /products:
+    get:
+      operationId: getProductsPage
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Product" }
 components:
   schemas:
     InterestRate:
@@ -170,6 +202,11 @@ components:
         compoundingFrequency: { type: integer }
         tenureMinDays: { type: integer }
         tenureMaxDays: { type: integer }
+    Product:
+      x-class-name: Product
+      properties:
+        productCode: { type: string }
+        productName: { type: string }
 
 --- InterestRateResourceImpl.java (hand-written, implements generated base) --
 package com.lr.trainong.depositrate.rest.internal.resource.v1_0;
@@ -208,6 +245,41 @@ public class InterestRateResourceImpl extends BaseInterestRateResourceImpl {
 	@Reference
 	private InterestRateLocalService _interestRateLocalService;
 }
+
+--- ProductResourceImpl.java (hand-written, implements generated base) -------
+package com.lr.trainong.depositrate.rest.internal.resource.v1_0;
+
+@Component(properties = "OSGI-INF/liferay/rest/v1_0/product.properties",
+	service = ProductResource.class)
+public class ProductResourceImpl extends BaseProductResourceImpl {
+
+	@Override
+	public Page<Product> getProductsPage() throws Exception {
+		List<com.lr.trainong.depositrate.model.DepositProduct> products =
+			_depositProductLocalService.findByActive(true);
+
+		return Page.of(
+			ListUtil.toList(
+				products,
+				product -> {
+					Product dto = new Product();
+
+					dto.setProductCode(product.getProductCode());
+					dto.setProductName(product.getProductName());
+
+					return dto;
+				}));
+	}
+
+	@Reference
+	private DepositProductLocalService _depositProductLocalService;
+}
+
+-- Product list changes about as rarely as the rate card itself, so the same
+-- PortalCache approach from the note below applies here too — cache the
+-- getProductsPage() result and invalidate it from wherever products are
+-- edited (admin UI / data import), rather than re-querying on every fragment
+-- render.
 
 -- Rates change rarely (a rate-card update, not a live feed) -- so cache the
 -- lookup instead of hitting the DB on every calculator interaction:
@@ -249,12 +321,6 @@ public class InterestRateResourceImpl extends BaseInterestRateResourceImpl {
 					"label": "Rate service base path",
 					"type": "text",
 					"defaultValue": "/o/deposit-rate/v1.0"
-				},
-				{
-					"name": "productOptions",
-					"label": "Products (code:label, comma separated)",
-					"type": "text",
-					"defaultValue": "TDR:Term Deposit,STDR:Special Term Deposit,RD:Recurring Deposit"
 				}
 			]
 		}
@@ -378,25 +444,37 @@ public class InterestRateResourceImpl extends BaseInterestRateResourceImpl {
 
 	var currentRate = null; // last rate fetched from the REST resource
 
-	function parseProductOptions() {
-		var raw = (config && config.productOptions) || '';
+	function fetchProducts() {
+		return fetch(restBase + '/products', {
+			headers: {Accept: 'application/json'},
+			credentials: 'same-origin'
+		})
+			.then(function(res) {
+				if (!res.ok) {
+					throw new Error('Product list fetch failed: ' + res.status);
+				}
+				return res.json();
+			})
+			.then(function(page) {
+				var products = (page && page.items) || [];
 
-		return raw.split(',').filter(Boolean).map(function(pair) {
-			var parts = pair.split(':');
+				products.forEach(function(product) {
+					var optionEl = document.createElement('option');
 
-			return {code: (parts[0] || '').trim(), label: (parts[1] || parts[0] || '').trim()};
-		});
-	}
+					optionEl.value = product.productCode;
+					optionEl.textContent = product.productName;
 
-	function populateProducts() {
-		parseProductOptions().forEach(function(opt) {
-			var optionEl = document.createElement('option');
+					productSelect.appendChild(optionEl);
+				});
 
-			optionEl.value = opt.code;
-			optionEl.textContent = opt.label;
-
-			productSelect.appendChild(optionEl);
-		});
+				// trigger the first rate lookup now that a product is selected
+				fetchInterestRate();
+			})
+			.catch(function(err) {
+				showError('Could not load the product list. Please refresh.');
+				/* eslint-disable-next-line no-console */
+				console.error(err);
+			});
 	}
 
 	function getTenureDays() {
@@ -525,6 +603,36 @@ public class InterestRateResourceImpl extends BaseInterestRateResourceImpl {
 		return principal * Math.pow(1 + r / n, n * tenureYears);
 	}
 
+	// True year-by-year compounding for the Annually payout option: each full
+	// year, the principal compounds quarterly (n=4) same as the cumulative
+	// case, but the year's interest is paid out rather than reinvested, so
+	// the next year starts from the same original principal again. This is
+	// what the doc means by "annual payouts ... but compounding within the
+	// year is still quarterly" — it is *not* totalInterest / tenureYears,
+	// which would understate early payouts and overstate later ones once
+	// compounding is taken into account.
+	function calculateAnnualPayoutPerYear(principal, ratePct) {
+		var n = 4;
+		var r = ratePct / 100;
+
+		return principal * (Math.pow(1 + r / n, n) - 1);
+	}
+
+	// Interest on the partial final year/period is not yet payable on an
+	// annual schedule, so it's rolled into the payout at maturity rather
+	// than averaged into the recurring per-year figure.
+	function calculateAnnualRemainderAtMaturity(principal, ratePct, tenureYears) {
+		var n = 4;
+		var r = ratePct / 100;
+		var remainderYears = tenureYears - Math.floor(tenureYears);
+
+		if (remainderYears <= 0) {
+			return 0;
+		}
+
+		return principal * (Math.pow(1 + r / n, n * remainderYears) - 1);
+	}
+
 	function calculatePayoutAmount(payoutFrequency, principal, ratePct, tenureYears, totalInterest) {
 		var totalMonths = tenureYears * 12;
 
@@ -540,7 +648,10 @@ public class InterestRateResourceImpl extends BaseInterestRateResourceImpl {
 				return totalMonths > 0 ? totalInterest / totalMonths : 0;
 
 			case 'ANNUALLY':
-				return tenureYears > 0 ? totalInterest / tenureYears : totalInterest;
+				// recurring amount paid at the end of each full year; any
+				// partial trailing year is settled at maturity (see
+				// calculateAnnualRemainderAtMaturity), not blended in here.
+				return calculateAnnualPayoutPerYear(principal, ratePct);
 
 			case 'MATURITY':
 			default:
@@ -583,11 +694,21 @@ public class InterestRateResourceImpl extends BaseInterestRateResourceImpl {
 
 		setOutput('maturityAmount', formatCurrency(maturityAmount));
 		setOutput('interestAmount', formatCurrency(totalInterest));
-		setOutput('payoutAmount', formatCurrency(payoutAmount));
+
+		if (payoutFrequency === 'ANNUALLY') {
+			var remainder = calculateAnnualRemainderAtMaturity(
+				principal, currentRate.interestRatePct, tenureYears);
+
+			setOutput('payoutAmount', formatCurrency(payoutAmount) + '/year' +
+				(remainder > 0 ? ' (+ ' + formatCurrency(remainder) + ' at maturity for the part-year)' : ''));
+		}
+		else {
+			setOutput('payoutAmount', formatCurrency(payoutAmount));
+		}
 	}
 
 	// -- wiring --
-	populateProducts();
+	fetchProducts();
 	updatePayoutOptions();
 
 	['tenureYears', 'tenureMonths', 'tenureDays'].forEach(function(field) {
@@ -640,5 +761,15 @@ Example: P=100000, r=8%, t=1 year, n=4 (quarterly)
   Total Interest (Accumulated) = 8243.00
   Quarterly Payout = 100000 * 0.08 / 4 = 2000.00/quarter [matches example]
   Monthly Payout ~= 8243 / 12 = 686.92 ~= 687/month [matches example]
-  Annual Payout (tenure > 1yr) = TotalInterest / tenureYears
   On Maturity Payout = TotalInterest in full
+
+Annual Payout (tenure > 1yr) — true year-by-year compounding, not a flat
+TotalInterest/tenureYears average, per the doc's own caveat that "compounding
+within the year is still quarterly":
+  Per-year payout = P * ((1 + r/4)^4 - 1)   [same figure repeats every full year,
+                                              since the payout removes that
+                                              year's interest and principal
+                                              resets to P for the next year]
+  e.g. P=100000, r=8%: 100000 * (1.02^4 - 1) = 8243.22/year
+  Partial trailing year (if tenure isn't a whole number of years) is settled
+  at maturity: remainder = P * ((1 + r/4)^(4 * fractionalYears) - 1)
