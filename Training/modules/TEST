@@ -1,0 +1,17 @@
+
+<%@page import="com.liferay.portal.kernel.util.PwdGenerator"%>
+<%@ include file="init.jsp" %>
+
+<script src="<%=request.getContextPath()%>/js/${configuredPortletView}.js?ver<%=PwdGenerator.getPassword(2)%>"></script>
+
+
+
+
+<c:choose>
+	<c:when test='${not empty configuredPortletView}'>
+		<c:import url="/jsps/portlet_view/${configuredPortletView}/landing.jsp" />
+	</c:when>
+	<c:otherwise>
+		<div class="alert alert-info">Please configure module view</div>
+	</c:otherwise>
+</c:choose>
