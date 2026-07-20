@@ -773,3 +773,186 @@ within the year is still quarterly":
   e.g. P=100000, r=8%: 100000 * (1.02^4 - 1) = 8243.22/year
   Partial trailing year (if tenure isn't a whole number of years) is settled
   at maturity: remainder = P * ((1 + r/4)^(4 * fractionalYears) - 1)
+
+--------------------------------------------------------------------------------
+6. REAL REMOTE SERVICE (as implemented) — InterestRateUploadService JS wiring
+--------------------------------------------------------------------------------
+Two methods added to InterestRateUploadServiceImpl (package
+com.sbi.core.service.service.impl) — this is a *ServiceImpl (remote service,
+not LocalServiceImpl), so Service Builder already exposes it over jsonws,
+no REST Builder module needed for these two:
+
+	public List<InterestRateUpload> findByIsActiveNStatusNCategoryNInterestRateNInterestType(
+			boolean isActive, String status, String country, String category,
+			double interestRate, String interestType)
+		throws NoSuchInterestRateUploadException {
+
+		return interestRateUploadPersistence.findByIsActiveNStatusNCountryNCategoryNInterestRateNInterestType(
+			isActive, status, country, category, interestRate, interestType);
+	}
+
+	public List<InterestRateUpload> findByIsActiveStatusCountryNCategory(
+			boolean isActive, String status, String country, String category) {
+
+		return interestRateUploadPersistence.findByIsActiveNStatusNCountryNCategory(
+			isActive, status, country, category);
+	}
+
+These replace the fictional customerType/productCode/tenureDays model the
+fragment assumed in sections 1-3 — swap fetchInterestRate() for
+fetchApplicableRate() below if you're wiring the fragment to this real
+service instead of the deposit-rate-rest scaffold.
+
+Note the jsonws path segments below are the standard camelCase -> kebab-case
+conversion Liferay applies to method names; confirm against your install's
+/api/jsonws listing (search "interestrateupload") if they don't resolve.
+
+--- index.html addition — "current rates" table -----------------------------
+<div class="dc-row">
+	<button type="button" class="dc-secondary-btn" data-action="view-rates">
+		View current interest rates
+	</button>
+</div>
+
+<table class="dc-rates-table" data-output="ratesTable">
+	<thead>
+		<tr>
+			<th>Category</th>
+			<th>Country</th>
+			<th>Interest Type</th>
+			<th>Rate</th>
+			<th>Status</th>
+		</tr>
+	</thead>
+	<tbody data-output="ratesTableBody"></tbody>
+</table>
+
+--- index.css addition --------------------------------------------------------
+.dc-secondary-btn {
+	background: #fff; color: #1a1a6c; border: 1px solid #1a1a6c;
+	border-radius: 6px; padding: 8px 20px; font-weight: 600; cursor: pointer;
+}
+.dc-secondary-btn:hover { background: #f0f0fa; }
+.dc-rates-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+.dc-rates-table th, .dc-rates-table td {
+	text-align: left; padding: 8px 10px; border-bottom: 1px solid #ddd;
+}
+.dc-rates-table th { background: #f5f5f5; font-size: 0.85rem; }
+
+--- index.js addition ----------------------------------------------------------
+// Add alongside the existing fetchInterestRate()/fetchProducts() functions.
+
+function fetchApplicableRate(isActive, status, country, category, interestRate, interestType) {
+	return new Promise(function(resolve, reject) {
+		Liferay.Service(
+			'/interestrateupload.interestrateupload/find-by-is-active-n-status-n-category-n-interest-rate-n-interest-type',
+			{
+				isActive: isActive,
+				status: status,
+				country: country,
+				category: category,
+				interestRate: interestRate,
+				interestType: interestType
+			},
+			function(rows) {
+				if (rows && rows.exception) {
+					reject(new Error(rows.exception));
+					return;
+				}
+				resolve(rows || []);
+			}
+		);
+	});
+}
+
+function fetchRatesTable(isActive, status, country, category) {
+	return new Promise(function(resolve, reject) {
+		Liferay.Service(
+			'/interestrateupload.interestrateupload/find-by-is-active-status-country-n-category',
+			{
+				isActive: isActive,
+				status: status,
+				country: country,
+				category: category
+			},
+			function(rows) {
+				if (rows && rows.exception) {
+					reject(new Error(rows.exception));
+					return;
+				}
+				resolve(rows || []);
+			}
+		);
+	});
+}
+
+// textContent, not innerHTML — rate-card rows can come from a CSV upload
+// path elsewhere in the app, so treat every field as untrusted text.
+function renderRatesTable(rows) {
+	var tbody = root.querySelector('[data-output="ratesTableBody"]');
+
+	if (!tbody) {
+		return;
+	}
+
+	tbody.innerHTML = '';
+
+	rows.forEach(function(row) {
+		var tr = document.createElement('tr');
+
+		[
+			row.category,
+			row.country,
+			row.interestType,
+			Number(row.interestRate).toFixed(2) + '%',
+			row.status
+		].forEach(function(value) {
+			var td = document.createElement('td');
+
+			td.textContent = value;
+			tr.appendChild(td);
+		});
+
+		tbody.appendChild(tr);
+	});
+}
+
+// -- wiring addition (goes in the existing "-- wiring --" block) --
+var viewRatesBtn = root.querySelector('[data-action="view-rates"]');
+
+if (viewRatesBtn) {
+	viewRatesBtn.addEventListener('click', function() {
+		var category = root.querySelector('input[name="customerType"]:checked').value;
+		var country = (config && config.country) || 'IN';
+
+		fetchRatesTable(true, 'ACTIVE', country, category)
+			.then(renderRatesTable)
+			.catch(function(err) {
+				showError('Could not load the current rates table.');
+				/* eslint-disable-next-line no-console */
+				console.error(err);
+			});
+	});
+}
+
+// -- using the real service for the calculator's own rate lookup instead of
+// fetchInterestRate()/deposit-rate-rest: --
+function fetchApplicableRateForCalculator(customerType, interestType) {
+	var country = (config && config.country) || 'IN';
+
+	return fetchApplicableRate(true, 'ACTIVE', country, customerType, 0, interestType)
+		.then(function(rows) {
+			currentRate = rows[0] ? {
+				interestRatePct: rows[0].interestRate,
+				compoundingFrequency: 4
+			} : null;
+
+			setOutput('interestRate', currentRate ? currentRate.interestRatePct.toFixed(2) + '%' : '-');
+
+			return currentRate;
+		});
+}
+
+-- configuration.json addition: add a "country" text field (defaultValue "IN")
+-- alongside restApplicationPath if your rate table is multi-country; drop it
+-- if country is always fixed and hardcode it in the two calls above instead.
