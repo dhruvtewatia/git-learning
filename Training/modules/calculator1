@@ -1,126 +1,103 @@
 ================================================================================
- Deposit Calculator — isolated debug: raw InterestRateUploadLocalService call
+ Deposit Calculator — isolated debug: core service vs. custom service call
 ================================================================================
-Purpose: isolate the service call from all the JSON-building/null-guard logic
-in `calculator` (section 7), to find out exactly where the "rate has
-evaluated to null or missing" error is really coming from. Fully static
-inputs — nothing computed, nothing looped over customerCategories. Every
-single field access is individually guarded with its own <#if x??> so that
-even if one specific property is the actual problem, it gets reported
-instead of crashing the whole render.
+Status: three rounds of guarding testRates (inline !, ??, splitting into a
+raw+defaulted assign) have all failed identically at ${testRates?size} —
+INSIDE guards that should make that expression impossible to fail. That's
+stopped being consistent with a null-handling bug. New leading theory:
 
-Static test values confirmed correct: true, "2", "South Africa", "Normal".
+  Liferay's Fragment FTL execution runs through a more restricted/sandboxed
+  configuration than an ADT does, and that sandbox may only allow reflection
+  into WHITELISTED (core Liferay) service interfaces and bean types. A
+  custom Service Builder interface like InterestRateUploadLocalService may
+  simply not be reachable from Fragment FTL at all on this instance — and
+  Liferay's generic error handling reports "evaluated to null or missing"
+  for that restriction instead of a clearer permission-denied message.
+  ??/! can't fix this: they only rescue an actual null value, not a call
+  that the sandbox refuses to make in the first place.
 
-Revision note: the previous version of this file asserted `testRates`
-directly from the method call, then checked `testRates??` on separate
-lines before dereferencing `?size`/`?is_sequence` on it. That still hit
-"testRates has evaluated to null or missing" at the ${testRates?size} call —
-*inside* the <#if testRates??> guard that should have prevented it ever
-running. `??`/`!` only catch a value being null; they cannot catch a Java
-exception being thrown during evaluation, and a guarded expression still
-failing behind its own guard is a strong signal this is a thrown exception
-being surfaced through FreeMarker's generic "null or missing" message
-rather than an actual null value. Applying `!` directly at the point of
-assignment (see rawTestRates/testRates split below) removes the ambiguity
-either way: if the *raw* call still throws, the exception surfaces exactly
-at the <#assign rawTestRates = ...> line instead of somewhere downstream
-behind a guard that looked like it should have worked.
+This file adds the one test that tells us definitively which it is: the
+exact same serviceLocator pattern, but against a service interface that is
+guaranteed to be core/whitelisted (UserLocalService, requesting nothing but
+a plain int user count via themeDisplay.getCompanyId() — no custom domain
+object involved at all).
 
-How to use:
-  1. Swap this in as your fragment's index.html content temporarily (in
-     place of the full calculator).
-  2. Publish the fragment and test on an ACTUAL PAGE, not just the Fragment
-     Editor's Draft preview panel — the last screenshot showed this running
-     in the unpublished Draft preview, which may execute FTL in a more
-     restricted context than a real page render (this hasn't been ruled out
-     yet and is now the most likely remaining variable).
-  3. If it still fails, check the server log (SystemOut/catalina.out) for
-     the same timestamp — Liferay typically logs the full Java stack trace
-     for a template-render failure server-side even when the on-screen
-     message is FreeMarker's generic summary. That trace will show the real
-     exception type/cause, which the on-screen FTL error can't.
-  4. Report back exactly what renders: the "Service located"/"Raw result
-     exists"/"Result size" lines, and each <li> row underneath.
+  - If the core-service block below renders a real number, and the custom
+    block still fails the same way it always has → confirms the sandbox/
+    allowlist theory. The fix at that point is NOT more FTL guarding; it's
+    going back to a REST Builder or @JSONWebService resource (sections 2/6
+    of `calculator`) so the custom entity data reaches the fragment through
+    a channel that isn't restricted this way, since that's server code
+    running as a trusted OSGi component rather than through Fragment FTL.
 
---- index.html (temporary, replaces the full calculator while debugging) ---
+  - If the core-service block ALSO fails the same way → serviceLocator
+    itself isn't functional in this execution context at all (regardless of
+    core vs. custom), which points back at the still-unconfirmed Draft
+    preview vs. published-page distinction, or a portal-wide FreeMarker
+    restricted-variables setting disabling serviceLocator for Fragments
+    entirely on this instance.
+
+Also relevant to the "it is not getting published" symptom: that means
+Liferay is running this FTL through a validation/compile pass at PUBLISH
+time itself, not only at page-render time — so whatever's failing here is
+failing before a real request/session context necessarily even exists,
+which is itself a point in favor of the sandbox-restriction theory over a
+data-dependent null.
+
+--- index.html (temporary — swap in for the fragment's real content) --------
 <div class="dc-debug">
-	<h3>Debug: Raw Service Call Test</h3>
+	<h3>Debug A: core service (should always work)</h3>
+
+	<#assign userLocalService = serviceLocator.findService("com.liferay.portal.kernel.service.UserLocalService")>
+	<p>Core service located: <#if userLocalService??>YES<#else>NO</#if></p>
+
+	<#assign userCount = userLocalService.getUserCount(themeDisplay.getCompanyId())>
+	<p>User count: ${userCount}</p>
+
+	<hr>
+
+	<h3>Debug B: custom service (the one that's been failing)</h3>
 
 	<#assign interestRateUploadLocalService = serviceLocator.findService("com.sbi.core.service.service.InterestRateUploadLocalService")>
-	<p>Service located: <#if interestRateUploadLocalService??>YES<#else>NO</#if></p>
+	<p>Custom service located: <#if interestRateUploadLocalService??>YES<#else>NO</#if></p>
 
-	<#-- Raw, unguarded assign on purpose: if the call itself throws, the
-	     error now points exactly here instead of somewhere downstream
-	     behind a guard that looked correct. -->
 	<#assign rawTestRates = interestRateUploadLocalService.findByIsActiveStatusCountryNCategory(true, "2", "South Africa", "Normal")>
 	<p>Raw result exists (not null): <#if rawTestRates??>YES<#else>NO</#if></p>
 
-	<#-- From here on, testRates can never be null — ![] guarantees an
-	     empty sequence instead, so every downstream ?size/?is_sequence/
-	     <#list> below is unconditionally safe regardless of what the raw
-	     call returned. -->
 	<#assign testRates = rawTestRates![]>
-	<p>Result is a sequence: <#if testRates?is_sequence>YES<#else>NO</#if></p>
 	<p>Result size: ${testRates?size}</p>
-
-	<ul>
-		<#list testRates as rate>
-			<li>
-				Index ${rate_index}:
-				<#if !rate??>
-					rate is NULL
-				<#else>
-					rate exists |
-					category=<#if rate.category??>${rate.category}<#else>[category missing]</#if> |
-					interestType=<#if rate.interestType??>${rate.interestType}<#else>[interestType missing]</#if> |
-					interestRate=<#if rate.interestRate??>${rate.interestRate}<#else>[interestRate missing]</#if> |
-					status=<#if rate.status??>${rate.status}<#else>[status missing]</#if>
-				</#if>
-			</li>
-		</#list>
-	</ul>
 </div>
 
 --------------------------------------------------------------------------------
-What each outcome would tell us
+How to read the result
 --------------------------------------------------------------------------------
-- "Service located: NO"
-    serviceLocator.findService(...) itself isn't resolving the interface —
-    wrong fully-qualified interface name, module not actually deployed with
-    that package path, or serviceLocator is restricted/unavailable in this
-    execution context (Fragment preview sandbox vs. real page render).
+Debug A "User count" prints a number, Debug B still errors at the exact same
+spot as every prior attempt
+    → Sandbox/allowlist restriction on custom service interfaces in Fragment
+      FTL. Stop iterating on guards here — move the rate lookup to a REST
+      Builder resource or @JSONWebService method instead (sections 2/6 of
+      `calculator`), called from index.js via fetch()/Liferay.Service()
+      rather than from FTL at all.
 
-- The error now appears at the <#assign rawTestRates = ...> line itself
-    Confirms this is a thrown Java exception, not a null value — check the
-    server log at this timestamp for the real stack trace. Common causes:
-    a bug in findByIsActiveNStatusNCountryNCategory's underlying SQL/finder,
-    a param-count/type mismatch against what's actually deployed, or the
-    method not existing yet on the deployed LocalService (Service Builder
-    not rerun after adding it).
+Debug A ALSO errors the same way
+    → serviceLocator is not functional in this execution context, full
+      stop, regardless of which service is being called. At that point:
+        - Confirm this is a published-page test, not the Fragment Editor's
+          Draft preview (still not confirmed from earlier rounds).
+        - Check this instance's FreeMarker restricted-variables portal
+          property / Fragment-authoring role permissions for whether
+          serviceLocator is deliberately disabled for Fragments here.
+        - If both come back clean and it still fails, this needs a real
+          Liferay support/community lookup with the full server-log stack
+          trace in hand rather than more guessing from the FTL error text
+          alone — a header saying "FreeMarker syntax is invalid" for what
+          is described as null-handling makes more sense as a Liferay-side
+          validation-layer message than a raw FreeMarker engine error.
 
-- "Raw result exists: NO" but no exception thrown
-    findByIsActiveStatusCountryNCategory returned Java null instead of an
-    empty list for this query — a persistence-layer bug worth fixing at the
-    source (the finder should return an empty List, never null). Harmless
-    here since testRates![] catches it, but still worth fixing upstream.
-
-- "Result size: 0"
-    The query ran fine but nothing matches isActive=true, status="2",
-    country="South Africa", category="Normal" — check the seeded data
-    matches those exact values (case-sensitivity included).
-
-- "rate is NULL" on some index
-    Confirms the underlying List really does contain a null element —
-    a genuine bug in findByIsActiveNStatusNCountryNCategory (or the SQL/
-    finder it delegates to), independent of anything in the fragment's FTL.
-
-- A specific field reported "[xxx missing]" while others show real values
-    rate itself is fine; that one column is null for that row (or the
-    getter name doesn't match what's assumed here) — narrows the fix to
-    that column specifically rather than the whole object.
-
-- Everything above renders fine on a published page but failed in the
-  Fragment Editor's Draft preview
-    Confirms the preview sandbox is the actual culprit — treat Draft
-    preview errors on serviceLocator-backed fragments as unreliable going
-    forward and always verify against a published page instead.
+Debug A works, Debug B's "Custom service located" is NO (not the rawTestRates
+line)
+    → the interface name itself isn't resolving — double check the fully
+      qualified name against what's actually in the deployed module (exact
+      package/interface name, and that Service Builder was rerun after
+      adding findByIsActiveStatusCountryNCategory so
+      InterestRateUploadLocalService actually has that method compiled in).
