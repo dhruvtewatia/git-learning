@@ -1,344 +1,64 @@
-================================================================================
- SBI-style Deposit Calculator — Liferay 7.3 UI Fragment + Service Builder rates
- Reference scaffold — adapt module/package names to your workspace before use.
-================================================================================
+<#-- Fragment HTML executes as a FreeMarker template in Liferay, so this
+     server-side block runs once per render, before any of the markup below
+     reaches the browser. -->
+<#assign interestRateUploadLocalService = serviceLocator.findService("com.sbi.core.service.service.InterestRateUploadLocalService")>
+<#assign countryCode = (configuration.country)!"IN">
+<#assign customerCategories = ["NORMAL", "SENIOR_CITIZEN", "CORPORATE"]>
 
---------------------------------------------------------------------------------
-0. ARCHITECTURE
---------------------------------------------------------------------------------
-Rates live in a DB table owned by Service Builder. The fragment never talks to
-Service Builder directly — it calls a REST Builder resource, because:
-  - typed OpenAPI contract (fragment JS + any other consumer share one schema)
-  - standard HTTP GET -> cacheable (ETag / Cache-Control), unlike jsonws
-  - no reflection-based invocation, smaller attack surface than jsonws
-  - versioned path (/v1.0/...) so the fragment doesn't break on service changes
+<div class="deposit-calculator" data-fragment-namespace="fragment_10001">
 
-  [deposit-calculator fragment]
-          | fetch() GET /products once on load, GET /interest-rates once per
-          | tenure/customer-type change (not per keystroke)
-          v
-  [deposit-rate-rest]  /o/deposit-rate/v1.0/{interest-rates,products}
-          | InterestRateLocalServiceUtil.findByCustomerType_Product_Tenure(...)
-          | DepositProductLocalServiceUtil.findByActive(true)
-          v
-  [deposit-rate-service]  InterestRate + DepositProduct entities (Service Builder)
+	<#-- SSR-embedded rate data: application/json so it's inert until the
+	     fragment's own JS explicitly JSON.parses it — never executed as a
+	     script, unlike a bare `var DEPOSIT_RATES = [...]` global.
 
-Section 4 shows the lighter-weight alternative (@JSONWebService + Liferay.Service)
-in case the extra REST module isn't worth it for your setup.
-
---------------------------------------------------------------------------------
-1. SERVICE BUILDER — module: deposit-rate/deposit-rate-service
---------------------------------------------------------------------------------
-
---- deposit-rate/deposit-rate-service/service.xml ---------------------------
-<?xml version="1.0"?>
-<!DOCTYPE service-builder PUBLIC "-//Liferay//DTD Service Builder 7.3.0//EN"
-	"http://www.liferay.com/dtd/liferay-service-builder_7_3_0.dtd">
-
-<service-builder package-path="com.lr.trainong.depositrate">
-	<namespace>DEPRATE</namespace>
-
-	<entity name="InterestRate" local-service="true" remote-service="false">
-		<column name="interestRateId" type="long" primary="true" />
-		<column name="companyId" type="long" />
-		<column name="groupId" type="long" />
-		<column name="createDate" type="Date" />
-		<column name="modifiedDate" type="Date" />
-
-		<!-- NORMAL | SENIOR_CITIZEN | CORPORATE -->
-		<column name="customerType" type="String" />
-		<column name="productCode" type="String" />
-
-		<!-- inclusive day-range this row applies to, e.g. 91-365 -->
-		<column name="tenureMinDays" type="int" />
-		<column name="tenureMaxDays" type="int" />
-
-		<column name="interestRatePct" type="double" />
-		<!-- compounding periods/year; spec fixes this at 4 (quarterly) -->
-		<column name="compoundingFrequency" type="int" />
-		<column name="active" type="boolean" />
-
-		<order by="asc">
-			<order-column name="tenureMinDays" />
-		</order>
-
-		<finder name="C_P_Active" return-type="Collection">
-			<finder-column name="customerType" />
-			<finder-column name="productCode" />
-			<finder-column name="active" />
-		</finder>
-	</entity>
-
-	<entity name="DepositProduct" local-service="true" remote-service="false">
-		<column name="productId" type="long" primary="true" />
-		<column name="companyId" type="long" />
-		<column name="groupId" type="long" />
-		<column name="createDate" type="Date" />
-		<column name="modifiedDate" type="Date" />
-
-		<column name="productCode" type="String" />
-		<column name="productName" type="String" />
-		<column name="active" type="boolean" />
-
-		<order by="asc">
-			<order-column name="productName" />
-		</order>
-
-		<finder name="Active" return-type="Collection">
-			<finder-column name="active" />
-		</finder>
-	</entity>
-</service-builder>
-
---- Custom range finder (added by hand to the generated *FinderImpl) --------
--- Service Builder can't express "tenureMinDays <= :days <= tenureMaxDays"
--- declaratively, so this method is added to InterestRateFinderImpl once and
--- survives regeneration because Finder classes aren't overwritten.
-
-package com.lr.trainong.depositrate.service.persistence.impl;
-
-public class InterestRateFinderImpl
-	extends InterestRateFinderBaseImpl implements InterestRateFinder {
-
-	public InterestRate findByCustomerType_Product_Tenure(
-			String customerType, String productCode, int tenureDays)
-		throws SystemException {
-
-		Session session = null;
-
-		try {
-			session = openSession();
-
-			String sql =
-				"SELECT * FROM DEPRATE_InterestRate WHERE customerType = ? " +
-				"AND productCode = ? AND active = ? " +
-				"AND tenureMinDays <= ? AND tenureMaxDays >= ?";
-
-			SQLQuery q = session.createSQLQuery(sql);
-
-			q.addEntity("DEPRATE_InterestRate", InterestRateImpl.class);
-
-			QueryPos qPos = QueryPos.getInstance(q);
-
-			qPos.add(customerType);
-			qPos.add(productCode);
-			qPos.add(true);
-			qPos.add(tenureDays);
-			qPos.add(tenureDays);
-
-			List<InterestRate> results = q.list();
-
-			return results.isEmpty() ? null : results.get(0);
-		}
-		catch (Exception e) {
-			throw new SystemException(e);
-		}
-		finally {
-			closeSession(session);
-		}
-	}
-}
-
---------------------------------------------------------------------------------
-2. REST BUILDER — module: deposit-rate/deposit-rate-rest   [RECOMMENDED PATH]
---------------------------------------------------------------------------------
-
---- deposit-rate-rest/rest-config.yaml ---------------------------------------
-apiDir: "rest-impl/src/main/java/com/lr/trainong/depositrate/rest"
-apiPackagePath: "com.lr.trainong.depositrate.rest"
-application:
-  baseURI: "deposit-rate"
-  className: "DepositRateApplication"
-  configurationPid: "com.lr.trainong.depositrate.rest.internal.configuration.DepositRateConfiguration"
-clientDir: "rest-client/src/main/java/com/lr/trainong/depositrate/rest/client"
-javaDataBinding: true
-openApiURL: "openapi.yaml"
-
---- deposit-rate-rest/openapi.yaml -------------------------------------------
-openapi: 3.0.1
-info:
-  title: deposit-rate-rest
-  version: v1.0
-paths:
-  /interest-rates:
-    get:
-      operationId: getInterestRate
-      parameters:
-        - name: customerType
-          in: query
-          required: true
-          schema: { type: string }
-        - name: productCode
-          in: query
-          required: true
-          schema: { type: string }
-        - name: tenureDays
-          in: query
-          required: true
-          schema: { type: integer }
-      responses:
-        200:
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/InterestRate" }
-  /products:
-    get:
-      operationId: getProductsPage
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/Product" }
-components:
-  schemas:
-    InterestRate:
-      x-class-name: InterestRate
-      properties:
-        customerType: { type: string }
-        productCode: { type: string }
-        interestRatePct: { type: number, format: double }
-        compoundingFrequency: { type: integer }
-        tenureMinDays: { type: integer }
-        tenureMaxDays: { type: integer }
-    Product:
-      x-class-name: Product
-      properties:
-        productCode: { type: string }
-        productName: { type: string }
-
---- InterestRateResourceImpl.java (hand-written, implements generated base) --
-package com.lr.trainong.depositrate.rest.internal.resource.v1_0;
-
-@Component(properties = "OSGI-INF/liferay/rest/v1_0/interest-rate.properties",
-	service = InterestRateResource.class)
-public class InterestRateResourceImpl extends BaseInterestRateResourceImpl {
-
-	@Override
-	public InterestRate getInterestRate(
-			String customerType, String productCode, int tenureDays)
-		throws Exception {
-
-		com.lr.trainong.depositrate.model.InterestRate rate =
-			_interestRateLocalService.findByCustomerType_Product_Tenure(
-				customerType, productCode, tenureDays);
-
-		if (rate == null) {
-			throw new NoSuchInterestRateException(
-				"No rate for " + customerType + "/" + productCode +
-					"/" + tenureDays + "d");
-		}
-
-		return new InterestRate() {
+	     Single pass, not accumulate-into-a-list-then-reloop: the earlier
+	     two-phase version (build `allRates` via `<#assign allRates =
+	     allRates + [rate]>` inside a nested loop, then `<#list allRates as
+	     rate>` separately) is what produced "rate has evaluated to null or
+	     missing" here — whether from FreeMarker's own list-reassignment
+	     semantics or a null element coming back from the persistence
+	     finder, avoiding the two-phase pattern and guarding each element
+	     with `rate??` sidesteps it either way. `!""`/`!0` defaults on the
+	     individual fields are the same null-safety FreeMarker's error
+	     message itself suggests. -->
+	<script type="application/json" data-output="ratesData">
+[
+<#assign isFirstRate = true>
+<#list customerCategories as category>
+	<#assign categoryRates = (interestRateUploadLocalService.findByIsActiveStatusCountryNCategory(true, "ACTIVE", countryCode, category))![]>
+	<#list categoryRates as rate>
+		<#if rate??>
+			<#if !isFirstRate>,</#if>
+			<#assign isFirstRate = false>
 			{
-				setCustomerType(rate.getCustomerType());
-				setProductCode(rate.getProductCode());
-				setInterestRatePct(rate.getInterestRatePct());
-				setCompoundingFrequency(rate.getCompoundingFrequency());
-				setTenureMinDays(rate.getTenureMinDays());
-				setTenureMaxDays(rate.getTenureMaxDays());
+				"category": "${(rate.category!"")?js_string}",
+				"interestType": "${(rate.interestType!"")?js_string}",
+				"interestRate": ${(rate.interestRate!0)?c},
+				"status": "${(rate.status!"")?js_string}"
 			}
-		};
-	}
-
-	@Reference
-	private InterestRateLocalService _interestRateLocalService;
-}
-
---- ProductResourceImpl.java (hand-written, implements generated base) -------
-package com.lr.trainong.depositrate.rest.internal.resource.v1_0;
-
-@Component(properties = "OSGI-INF/liferay/rest/v1_0/product.properties",
-	service = ProductResource.class)
-public class ProductResourceImpl extends BaseProductResourceImpl {
-
-	@Override
-	public Page<Product> getProductsPage() throws Exception {
-		List<com.lr.trainong.depositrate.model.DepositProduct> products =
-			_depositProductLocalService.findByActive(true);
-
-		return Page.of(
-			ListUtil.toList(
-				products,
-				product -> {
-					Product dto = new Product();
-
-					dto.setProductCode(product.getProductCode());
-					dto.setProductName(product.getProductName());
-
-					return dto;
-				}));
-	}
-
-	@Reference
-	private DepositProductLocalService _depositProductLocalService;
-}
-
--- Product list changes about as rarely as the rate card itself, so the same
--- PortalCache approach from the note below applies here too — cache the
--- getProductsPage() result and invalidate it from wherever products are
--- edited (admin UI / data import), rather than re-querying on every fragment
--- render.
-
--- Rates change rarely (a rate-card update, not a live feed) -- so cache the
--- lookup instead of hitting the DB on every calculator interaction:
---
---   @Reference
---   private volatile MultiVMPool _multiVMPool;   // or PortalCache directly
---
---   PortalCache<String, InterestRate> cache = _multiVMPool.getCache(
---       "DEPOSIT_RATE_CACHE");
---   String key = customerType + "|" + productCode + "|" + tenureDays;
---   InterestRate cached = cache.get(key);
---   if (cached == null) { cached = lookup(...); cache.put(key, cached); }
---
--- This turns a DB round-trip into a memory lookup for the 99% case where the
--- rate card hasn't changed since the last portal restart, without you having
--- to hand-roll invalidation — PortalCache is already cluster-aware.
-
---------------------------------------------------------------------------------
-3. UI FRAGMENT — deposit-calculator (fragment.json / index.html / .css / .js)
---------------------------------------------------------------------------------
-
---- fragment.json -------------------------------------------------------------
-{
-	"cssPath": "index.css",
-	"htmlPath": "index.html",
-	"jsPath": "index.js",
-	"configurationPath": "configuration.json",
-	"name": "Deposit Calculator",
-	"type": "component"
-}
-
---- configuration.json ---------------------------------------------------------
-{
-	"fieldSets": [
-		{
-			"fields": [
-				{
-					"name": "restApplicationPath",
-					"label": "Rate service base path",
-					"type": "text",
-					"defaultValue": "/o/deposit-rate/v1.0"
-				}
-			]
-		}
-	]
-}
-
---- index.html ------------------------------------------------------------------
-<div class="deposit-calculator" data-fragment-namespace="${fragmentEntryLinkId}">
+		</#if>
+	</#list>
+</#list>
+]
+	</script>
 
 	<h2 class="dc-title">Deposit Calculator</h2>
 
 	<div class="dc-row">
 		<label class="dc-label">Type of Customer *</label>
 		<div class="dc-radio-group" data-field="customerType">
-			<label><input type="radio" name="customerType" value="NORMAL" checked> Normal</label>
-			<label><input type="radio" name="customerType" value="SENIOR_CITIZEN"> Senior Citizen</label>
-			<label><input type="radio" name="customerType" value="CORPORATE"> Corporate</label>
+		<#list customerCategories as category>
+			<label>
+				<input type="radio" name="customerType" value="${category?html}"<#if category_index == 0> checked</#if>>
+				${category?replace("_", " ")?capitalize}
+			</label>
+		</#list>
 		</div>
+	</div>
+
+	<div class="dc-row">
+		<label class="dc-label" for="dc-interest-type">Please select the product *</label>
+		<select id="dc-interest-type" class="dc-input" data-field="interestType"></select>
 	</div>
 
 	<div class="dc-row">
@@ -348,11 +68,6 @@ public class ProductResourceImpl extends BaseProductResourceImpl {
 			<input type="number" class="dc-input" data-field="tenureMonths" min="0" max="12" value="0" placeholder="Months">
 			<input type="number" class="dc-input" data-field="tenureDays" min="0" max="31" value="0" placeholder="Days">
 		</div>
-	</div>
-
-	<div class="dc-row">
-		<label class="dc-label" for="dc-product">Please select the product *</label>
-		<select id="dc-product" class="dc-input" data-field="productCode"></select>
 	</div>
 
 	<div class="dc-row">
@@ -395,86 +110,124 @@ public class ProductResourceImpl extends BaseProductResourceImpl {
 		</div>
 	</div>
 
-	<p class="dc-disclaimer">*Maturity amount shown here is indicative only.</p>
+	<div class="dc-row">
+		<button type="button" class="dc-secondary-btn" data-action="view-rates">View current interest rates</button>
+	</div>
+
+	<table class="dc-rates-table" data-output="ratesTable" hidden>
+		<thead>
+			<tr>
+				<th>Category</th>
+				<th>Interest Type</th>
+				<th>Rate</th>
+				<th>Status</th>
+			</tr>
+		</thead>
+		<tbody data-output="ratesTableBody"></tbody>
+	</table>
+
+	<p class="dc-disclaimer">*Maturity amount shown here is indicative only. Rates reflect the page's last render.</p>
 </div>
 
---- index.css ---------------------------------------------------------------
-.deposit-calculator { max-width: 640px; font-family: inherit; }
-.dc-title { margin-bottom: 16px; }
-.dc-row { margin-bottom: 14px; }
-.dc-label { display: block; font-weight: 600; margin-bottom: 6px; }
-.dc-input {
-	width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px;
-}
-.dc-tenure-group { display: flex; gap: 8px; }
-.dc-radio-group { display: flex; gap: 16px; flex-wrap: wrap; }
-.dc-radio-group label { display: flex; align-items: center; gap: 6px; }
-.dc-radio-group input:disabled + * { color: #999; }
-.dc-error { color: #b00020; }
-.dc-calculate-btn {
-	background: #1a1a6c; color: #fff; border: none; border-radius: 6px;
-	padding: 10px 24px; font-weight: 600; cursor: pointer;
-}
-.dc-calculate-btn:hover { background: #101050; }
-.dc-results { margin-top: 24px; }
-.dc-card {
-	background: #1a1a6c; color: #fff; border-radius: 8px; padding: 14px 16px;
-	margin-bottom: 10px; display: flex; flex-direction: column; gap: 4px;
-}
-.dc-card-label { font-size: 0.85rem; opacity: 0.85; }
-.dc-card-value { font-size: 1.25rem; font-weight: 700; }
-.dc-disclaimer { font-size: 0.75rem; color: #777; margin-top: 12px; }
 
---- index.js ------------------------------------------------------------------
+
+-----------------------------JS-------------------------------------------
+
+
 // Liferay Fragment JS runs with `fragmentElement` and `configuration` already
-// in scope — no wrapping module/import needed.
+// in scope. Every rate this file needs was embedded server-side by the FTL
+// block in index.html, so there is no fetch()/Promise/retry code here at all.
 
-(function initDepositCalculator(root, config) {
+(function initDepositCalculator(root) {
 	if (!root) {
 		return;
 	}
 
-	var restBase = (config && config.restApplicationPath) ||
-		'/o/deposit-rate/v1.0';
+	var rates = [];
+	var ratesDataEl = root.querySelector('[data-output="ratesData"]');
 
-	var productSelect = root.querySelector('[data-field="productCode"]');
+	try {
+		rates = ratesDataEl ? JSON.parse(ratesDataEl.textContent) : [];
+	}
+	catch (err) {
+		/* eslint-disable-next-line no-console */
+		console.error('Could not parse embedded rate data', err);
+	}
+
+	var interestTypeSelect = root.querySelector('[data-field="interestType"]');
 	var payoutRadios = root.querySelectorAll('input[name="payoutFrequency"]');
 	var errorEl = root.querySelector('[data-field="error"]');
 	var calculateBtn = root.querySelector('[data-action="calculate"]');
+	var viewRatesBtn = root.querySelector('[data-action="view-rates"]');
+	var ratesTable = root.querySelector('[data-output="ratesTable"]');
 
-	var currentRate = null; // last rate fetched from the REST resource
+	function getSelectedCategory() {
+		var checked = root.querySelector('input[name="customerType"]:checked');
 
-	function fetchProducts() {
-		return fetch(restBase + '/products', {
-			headers: {Accept: 'application/json'},
-			credentials: 'same-origin'
-		})
-			.then(function(res) {
-				if (!res.ok) {
-					throw new Error('Product list fetch failed: ' + res.status);
-				}
-				return res.json();
-			})
-			.then(function(page) {
-				var products = (page && page.items) || [];
+		return checked ? checked.value : null;
+	}
 
-				products.forEach(function(product) {
-					var optionEl = document.createElement('option');
+	function getRatesForCategory(category) {
+		return rates.filter(function(rate) {
+			return rate.category === category;
+		});
+	}
 
-					optionEl.value = product.productCode;
-					optionEl.textContent = product.productName;
+	function findSelectedRate() {
+		var category = getSelectedCategory();
+		var interestType = interestTypeSelect.value;
 
-					productSelect.appendChild(optionEl);
-				});
+		return rates.filter(function(rate) {
+			return rate.category === category && rate.interestType === interestType;
+		})[0] || null;
+	}
 
-				// trigger the first rate lookup now that a product is selected
-				fetchInterestRate();
-			})
-			.catch(function(err) {
-				showError('Could not load the product list. Please refresh.');
-				/* eslint-disable-next-line no-console */
-				console.error(err);
-			});
+	function setOutput(field, value) {
+		var el = root.querySelector('[data-output="' + field + '"]');
+
+		if (el) {
+			el.textContent = value;
+		}
+	}
+
+	function updateSelectedRateDisplay() {
+		var rate = findSelectedRate();
+
+		setOutput('interestRate', rate ? rate.interestRate.toFixed(2) + '%' : '-');
+	}
+
+	function populateInterestTypes() {
+		var previousValue = interestTypeSelect.value;
+		var options = getRatesForCategory(getSelectedCategory());
+
+		interestTypeSelect.innerHTML = '';
+
+		options.forEach(function(rate) {
+			var optionEl = document.createElement('option');
+
+			optionEl.value = rate.interestType;
+			optionEl.textContent = rate.interestType + ' (' + rate.interestRate.toFixed(2) + '%)';
+
+			interestTypeSelect.appendChild(optionEl);
+		});
+
+		if (options.some(function(rate) { return rate.interestType === previousValue; })) {
+			interestTypeSelect.value = previousValue;
+		}
+
+		updateSelectedRateDisplay();
+	}
+
+	function showError(message) {
+		if (!errorEl) {
+			return;
+		}
+		errorEl.textContent = message;
+		errorEl.hidden = !message;
+	}
+
+	function formatCurrency(amount) {
+		return '₹' + amount.toFixed(2);
 	}
 
 	function getTenureDays() {
@@ -521,8 +274,6 @@ public class ProductResourceImpl extends BaseProductResourceImpl {
 			}
 		});
 
-		// Fall back to On Maturity if the previously-selected option just
-		// became unavailable (e.g. user shrank the tenure after picking Annually).
 		var anyChecked = Array.prototype.some.call(payoutRadios, function(r) {
 			return r.checked;
 		});
@@ -536,65 +287,6 @@ public class ProductResourceImpl extends BaseProductResourceImpl {
 		}
 	}
 
-	function fetchInterestRate() {
-		var customerType = root.querySelector('input[name="customerType"]:checked').value;
-		var productCode = productSelect.value;
-		var tenureDays = getTenureDays();
-
-		if (!productCode || tenureDays <= 0) {
-			currentRate = null;
-			setOutput('interestRate', '-');
-			return Promise.resolve(null);
-		}
-
-		var url = restBase + '/interest-rates?customerType=' +
-			encodeURIComponent(customerType) + '&productCode=' +
-			encodeURIComponent(productCode) + '&tenureDays=' + tenureDays;
-
-		return fetch(url, {
-			headers: {Accept: 'application/json'},
-			credentials: 'same-origin'
-		})
-			.then(function(res) {
-				if (!res.ok) {
-					throw new Error('Rate lookup failed: ' + res.status);
-				}
-				return res.json();
-			})
-			.then(function(rate) {
-				currentRate = rate;
-				setOutput('interestRate', rate.interestRatePct.toFixed(2) + '%');
-				return rate;
-			})
-			.catch(function(err) {
-				currentRate = null;
-				setOutput('interestRate', '-');
-				showError('Could not fetch the interest rate. Please try again.');
-				/* eslint-disable-next-line no-console */
-				console.error(err);
-			});
-	}
-
-	function setOutput(field, value) {
-		var el = root.querySelector('[data-output="' + field + '"]');
-
-		if (el) {
-			el.textContent = value;
-		}
-	}
-
-	function showError(message) {
-		if (!errorEl) {
-			return;
-		}
-		errorEl.textContent = message;
-		errorEl.hidden = !message;
-	}
-
-	function formatCurrency(amount) {
-		return '₹' + amount.toFixed(2);
-	}
-
 	// Annexure 4: A = P x (1 + r/n)^(n x t), n fixed at 4 (quarterly).
 	function calculateMaturity(principal, ratePct, tenureYears) {
 		var n = 4;
@@ -603,14 +295,9 @@ public class ProductResourceImpl extends BaseProductResourceImpl {
 		return principal * Math.pow(1 + r / n, n * tenureYears);
 	}
 
-	// True year-by-year compounding for the Annually payout option: each full
-	// year, the principal compounds quarterly (n=4) same as the cumulative
-	// case, but the year's interest is paid out rather than reinvested, so
-	// the next year starts from the same original principal again. This is
-	// what the doc means by "annual payouts ... but compounding within the
-	// year is still quarterly" — it is *not* totalInterest / tenureYears,
-	// which would understate early payouts and overstate later ones once
-	// compounding is taken into account.
+	// Per-year payout for Annually: quarterly compounding within the year,
+	// principal resets each year since the payout removes that year's
+	// interest rather than reinvesting it.
 	function calculateAnnualPayoutPerYear(principal, ratePct) {
 		var n = 4;
 		var r = ratePct / 100;
@@ -618,9 +305,6 @@ public class ProductResourceImpl extends BaseProductResourceImpl {
 		return principal * (Math.pow(1 + r / n, n) - 1);
 	}
 
-	// Interest on the partial final year/period is not yet payable on an
-	// annual schedule, so it's rolled into the payout at maturity rather
-	// than averaged into the recurring per-year figure.
 	function calculateAnnualRemainderAtMaturity(principal, ratePct, tenureYears) {
 		var n = 4;
 		var r = ratePct / 100;
@@ -648,9 +332,6 @@ public class ProductResourceImpl extends BaseProductResourceImpl {
 				return totalMonths > 0 ? totalInterest / totalMonths : 0;
 
 			case 'ANNUALLY':
-				// recurring amount paid at the end of each full year; any
-				// partial trailing year is settled at maturity (see
-				// calculateAnnualRemainderAtMaturity), not blended in here.
 				return calculateAnnualPayoutPerYear(principal, ratePct);
 
 			case 'MATURITY':
@@ -659,15 +340,15 @@ public class ProductResourceImpl extends BaseProductResourceImpl {
 		}
 	}
 
-	function validate(principal, tenureDays) {
+	function validate(principal, tenureDays, rate) {
 		if (!principal || principal < 10000 || principal > 999999) {
 			return 'Amount must be between ₹10,000 and ₹9,99,999.';
 		}
 		if (tenureDays <= 0) {
 			return 'Please enter a valid tenure.';
 		}
-		if (!currentRate) {
-			return 'Interest rate not available for this selection yet.';
+		if (!rate) {
+			return 'No active rate found for this selection.';
 		}
 		return null;
 	}
@@ -679,25 +360,25 @@ public class ProductResourceImpl extends BaseProductResourceImpl {
 		var tenureDays = getTenureDays();
 		var tenureYears = getTenureYearsDecimal();
 		var payoutFrequency = root.querySelector('input[name="payoutFrequency"]:checked').value;
+		var rate = findSelectedRate();
 
-		var validationError = validate(principal, tenureDays);
+		var validationError = validate(principal, tenureDays, rate);
 
 		if (validationError) {
 			showError(validationError);
 			return;
 		}
 
-		var maturityAmount = calculateMaturity(principal, currentRate.interestRatePct, tenureYears);
+		var maturityAmount = calculateMaturity(principal, rate.interestRate, tenureYears);
 		var totalInterest = maturityAmount - principal;
 		var payoutAmount = calculatePayoutAmount(
-			payoutFrequency, principal, currentRate.interestRatePct, tenureYears, totalInterest);
+			payoutFrequency, principal, rate.interestRate, tenureYears, totalInterest);
 
 		setOutput('maturityAmount', formatCurrency(maturityAmount));
 		setOutput('interestAmount', formatCurrency(totalInterest));
 
 		if (payoutFrequency === 'ANNUALLY') {
-			var remainder = calculateAnnualRemainderAtMaturity(
-				principal, currentRate.interestRatePct, tenureYears);
+			var remainder = calculateAnnualRemainderAtMaturity(principal, rate.interestRate, tenureYears);
 
 			setOutput('payoutAmount', formatCurrency(payoutAmount) + '/year' +
 				(remainder > 0 ? ' (+ ' + formatCurrency(remainder) + ' at maturity for the part-year)' : ''));
@@ -707,252 +388,59 @@ public class ProductResourceImpl extends BaseProductResourceImpl {
 		}
 	}
 
+	// textContent, not innerHTML — defense in depth even though this data
+	// came from our own SSR block, in case the entity ever grows a
+	// free-text field editable outside a strict enum.
+	function renderRatesTable() {
+		var tbody = root.querySelector('[data-output="ratesTableBody"]');
+
+		if (!tbody) {
+			return;
+		}
+
+		tbody.innerHTML = '';
+
+		rates.forEach(function(rate) {
+			var tr = document.createElement('tr');
+
+			[
+				rate.category,
+				rate.interestType,
+				rate.interestRate.toFixed(2) + '%',
+				rate.status
+			].forEach(function(value) {
+				var td = document.createElement('td');
+
+				td.textContent = value;
+				tr.appendChild(td);
+			});
+
+			tbody.appendChild(tr);
+		});
+	}
+
 	// -- wiring --
-	fetchProducts();
+	renderRatesTable();
+	populateInterestTypes();
 	updatePayoutOptions();
 
-	['tenureYears', 'tenureMonths', 'tenureDays'].forEach(function(field) {
-		root.querySelector('[data-field="' + field + '"]').addEventListener('input', function() {
-			updatePayoutOptions();
-			fetchInterestRate();
-		});
-	});
-
 	root.querySelectorAll('input[name="customerType"]').forEach(function(radio) {
-		radio.addEventListener('change', fetchInterestRate);
+		radio.addEventListener('change', populateInterestTypes);
 	});
 
-	productSelect.addEventListener('change', fetchInterestRate);
+	interestTypeSelect.addEventListener('change', updateSelectedRateDisplay);
+
+	['tenureYears', 'tenureMonths', 'tenureDays'].forEach(function(field) {
+		root.querySelector('[data-field="' + field + '"]').addEventListener('input', updatePayoutOptions);
+	});
+
+	if (viewRatesBtn && ratesTable) {
+		viewRatesBtn.addEventListener('click', function() {
+			ratesTable.hidden = !ratesTable.hidden;
+			viewRatesBtn.textContent = ratesTable.hidden ?
+				'View current interest rates' : 'Hide current interest rates';
+		});
+	}
 
 	calculateBtn.addEventListener('click', handleCalculate);
-})(fragmentElement.querySelector('.deposit-calculator'), configuration);
-
---------------------------------------------------------------------------------
-4. ALTERNATIVE (lighter-weight, no REST module) — @JSONWebService
---------------------------------------------------------------------------------
-Skip section 2 entirely and annotate the local service method instead:
-
-	@JSONWebService
-	public InterestRate findByCustomerType_Product_Tenure(
-			String customerType, String productCode, int tenureDays)
-		throws PortalException { ... }
-
-Call it from index.js with Liferay's built-in helper (handles the portal's
-CSRF token and auth cookie for you):
-
-	Liferay.Service(
-		'/interestrate.interestrate/find-by-customer-type-product-tenure',
-		{customerType: customerType, productCode: productCode, tenureDays: tenureDays},
-		function(rate) { setOutput('interestRate', rate.interestRatePct + '%'); }
-	);
-
-Trade-off vs. section 2: less code to ship, but the payload/URL shape is tied
-to the service's Java method signature (breaks silently if you rename/reorder
-params), there's no OpenAPI contract for other consumers, and GET-style
-caching doesn't apply since jsonws calls are POSTed. Fine for an internal,
-single-fragment integration; REST Builder earns its keep once more than one
-client needs these rates or the contract needs to be stable long-term.
-
---------------------------------------------------------------------------------
-5. FORMULA REFERENCE (from Annexure 4, verified against the worked example)
---------------------------------------------------------------------------------
-Example: P=100000, r=8%, t=1 year, n=4 (quarterly)
-  Maturity Amount = 100000 * (1 + 0.08/4)^4 = 108243.00 [matches example: 1,08,243]
-  Total Interest (Accumulated) = 8243.00
-  Quarterly Payout = 100000 * 0.08 / 4 = 2000.00/quarter [matches example]
-  Monthly Payout ~= 8243 / 12 = 686.92 ~= 687/month [matches example]
-  On Maturity Payout = TotalInterest in full
-
-Annual Payout (tenure > 1yr) — true year-by-year compounding, not a flat
-TotalInterest/tenureYears average, per the doc's own caveat that "compounding
-within the year is still quarterly":
-  Per-year payout = P * ((1 + r/4)^4 - 1)   [same figure repeats every full year,
-                                              since the payout removes that
-                                              year's interest and principal
-                                              resets to P for the next year]
-  e.g. P=100000, r=8%: 100000 * (1.02^4 - 1) = 8243.22/year
-  Partial trailing year (if tenure isn't a whole number of years) is settled
-  at maturity: remainder = P * ((1 + r/4)^(4 * fractionalYears) - 1)
-
---------------------------------------------------------------------------------
-6. REAL REMOTE SERVICE (as implemented) — InterestRateUploadService JS wiring
---------------------------------------------------------------------------------
-Two methods added to InterestRateUploadServiceImpl (package
-com.sbi.core.service.service.impl) — this is a *ServiceImpl (remote service,
-not LocalServiceImpl), so Service Builder already exposes it over jsonws,
-no REST Builder module needed for these two:
-
-	public List<InterestRateUpload> findByIsActiveNStatusNCategoryNInterestRateNInterestType(
-			boolean isActive, String status, String country, String category,
-			double interestRate, String interestType)
-		throws NoSuchInterestRateUploadException {
-
-		return interestRateUploadPersistence.findByIsActiveNStatusNCountryNCategoryNInterestRateNInterestType(
-			isActive, status, country, category, interestRate, interestType);
-	}
-
-	public List<InterestRateUpload> findByIsActiveStatusCountryNCategory(
-			boolean isActive, String status, String country, String category) {
-
-		return interestRateUploadPersistence.findByIsActiveNStatusNCountryNCategory(
-			isActive, status, country, category);
-	}
-
-These replace the fictional customerType/productCode/tenureDays model the
-fragment assumed in sections 1-3 — swap fetchInterestRate() for
-fetchApplicableRate() below if you're wiring the fragment to this real
-service instead of the deposit-rate-rest scaffold.
-
-Note the jsonws path segments below are the standard camelCase -> kebab-case
-conversion Liferay applies to method names; confirm against your install's
-/api/jsonws listing (search "interestrateupload") if they don't resolve.
-
---- index.html addition — "current rates" table -----------------------------
-<div class="dc-row">
-	<button type="button" class="dc-secondary-btn" data-action="view-rates">
-		View current interest rates
-	</button>
-</div>
-
-<table class="dc-rates-table" data-output="ratesTable">
-	<thead>
-		<tr>
-			<th>Category</th>
-			<th>Country</th>
-			<th>Interest Type</th>
-			<th>Rate</th>
-			<th>Status</th>
-		</tr>
-	</thead>
-	<tbody data-output="ratesTableBody"></tbody>
-</table>
-
---- index.css addition --------------------------------------------------------
-.dc-secondary-btn {
-	background: #fff; color: #1a1a6c; border: 1px solid #1a1a6c;
-	border-radius: 6px; padding: 8px 20px; font-weight: 600; cursor: pointer;
-}
-.dc-secondary-btn:hover { background: #f0f0fa; }
-.dc-rates-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-.dc-rates-table th, .dc-rates-table td {
-	text-align: left; padding: 8px 10px; border-bottom: 1px solid #ddd;
-}
-.dc-rates-table th { background: #f5f5f5; font-size: 0.85rem; }
-
---- index.js addition ----------------------------------------------------------
-// Add alongside the existing fetchInterestRate()/fetchProducts() functions.
-
-function fetchApplicableRate(isActive, status, country, category, interestRate, interestType) {
-	return new Promise(function(resolve, reject) {
-		Liferay.Service(
-			'/interestrateupload.interestrateupload/find-by-is-active-n-status-n-category-n-interest-rate-n-interest-type',
-			{
-				isActive: isActive,
-				status: status,
-				country: country,
-				category: category,
-				interestRate: interestRate,
-				interestType: interestType
-			},
-			function(rows) {
-				if (rows && rows.exception) {
-					reject(new Error(rows.exception));
-					return;
-				}
-				resolve(rows || []);
-			}
-		);
-	});
-}
-
-function fetchRatesTable(isActive, status, country, category) {
-	return new Promise(function(resolve, reject) {
-		Liferay.Service(
-			'/interestrateupload.interestrateupload/find-by-is-active-status-country-n-category',
-			{
-				isActive: isActive,
-				status: status,
-				country: country,
-				category: category
-			},
-			function(rows) {
-				if (rows && rows.exception) {
-					reject(new Error(rows.exception));
-					return;
-				}
-				resolve(rows || []);
-			}
-		);
-	});
-}
-
-// textContent, not innerHTML — rate-card rows can come from a CSV upload
-// path elsewhere in the app, so treat every field as untrusted text.
-function renderRatesTable(rows) {
-	var tbody = root.querySelector('[data-output="ratesTableBody"]');
-
-	if (!tbody) {
-		return;
-	}
-
-	tbody.innerHTML = '';
-
-	rows.forEach(function(row) {
-		var tr = document.createElement('tr');
-
-		[
-			row.category,
-			row.country,
-			row.interestType,
-			Number(row.interestRate).toFixed(2) + '%',
-			row.status
-		].forEach(function(value) {
-			var td = document.createElement('td');
-
-			td.textContent = value;
-			tr.appendChild(td);
-		});
-
-		tbody.appendChild(tr);
-	});
-}
-
-// -- wiring addition (goes in the existing "-- wiring --" block) --
-var viewRatesBtn = root.querySelector('[data-action="view-rates"]');
-
-if (viewRatesBtn) {
-	viewRatesBtn.addEventListener('click', function() {
-		var category = root.querySelector('input[name="customerType"]:checked').value;
-		var country = (config && config.country) || 'IN';
-
-		fetchRatesTable(true, 'ACTIVE', country, category)
-			.then(renderRatesTable)
-			.catch(function(err) {
-				showError('Could not load the current rates table.');
-				/* eslint-disable-next-line no-console */
-				console.error(err);
-			});
-	});
-}
-
-// -- using the real service for the calculator's own rate lookup instead of
-// fetchInterestRate()/deposit-rate-rest: --
-function fetchApplicableRateForCalculator(customerType, interestType) {
-	var country = (config && config.country) || 'IN';
-
-	return fetchApplicableRate(true, 'ACTIVE', country, customerType, 0, interestType)
-		.then(function(rows) {
-			currentRate = rows[0] ? {
-				interestRatePct: rows[0].interestRate,
-				compoundingFrequency: 4
-			} : null;
-
-			setOutput('interestRate', currentRate ? currentRate.interestRatePct.toFixed(2) + '%' : '-');
-
-			return currentRate;
-		});
-}
-
--- configuration.json addition: add a "country" text field (defaultValue "IN")
--- alongside restApplicationPath if your rate table is multi-country; drop it
--- if country is always fixed and hardcode it in the two calls above instead.
+})(fragmentElement.querySelector('.deposit-calculator'));
