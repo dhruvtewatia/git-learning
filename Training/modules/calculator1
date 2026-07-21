@@ -1,0 +1,80 @@
+================================================================================
+ Deposit Calculator — isolated debug: raw InterestRateUploadLocalService call
+================================================================================
+Purpose: isolate the service call from all the JSON-building/null-guard logic
+in `calculator` (section 7), to find out exactly where the "rate has
+evaluated to null or missing" error is really coming from. Fully static
+inputs ("NORMAL"/"IN"/"ACTIVE"/true) — nothing computed, nothing looped over
+customerCategories. Every single field access is individually guarded with
+its own <#if x??> so that even if one specific property is the actual
+problem, it gets reported instead of crashing the whole render.
+
+How to use:
+  1. Swap this in as your fragment's index.html content temporarily (in
+     place of the full calculator).
+  2. Publish/save and view the rendered page — not just the Fragment
+     Editor's live preview panel, to rule out preview-sandbox restrictions
+     on serviceLocator-backed calls as a variable.
+  3. Report back exactly what renders: the "Service located"/"Result
+     exists"/"Result size" lines, and each <li> row underneath.
+
+--- index.html (temporary, replaces the full calculator while debugging) ---
+<div class="dc-debug">
+	<h3>Debug: Raw Service Call Test</h3>
+
+	<#assign interestRateUploadLocalService = serviceLocator.findService("com.sbi.core.service.service.InterestRateUploadLocalService")>
+	<p>Service located: <#if interestRateUploadLocalService??>YES<#else>NO</#if></p>
+
+	<#assign testRates = interestRateUploadLocalService.findByIsActiveStatusCountryNCategory(true, "ACTIVE", "IN", "NORMAL")>
+	<p>Result exists: <#if testRates??>YES<#else>NO</#if></p>
+	<p>Result is a sequence: <#if testRates?? && testRates?is_sequence>YES<#else>NO</#if></p>
+	<p>Result size: <#if testRates??>${testRates?size}<#else>N/A</#if></p>
+
+	<ul>
+	<#if testRates??>
+		<#list testRates as rate>
+			<li>
+				Index ${rate_index}:
+				<#if !rate??>
+					rate is NULL
+				<#else>
+					rate exists |
+					category=<#if rate.category??>${rate.category}<#else>[category missing]</#if> |
+					interestType=<#if rate.interestType??>${rate.interestType}<#else>[interestType missing]</#if> |
+					interestRate=<#if rate.interestRate??>${rate.interestRate}<#else>[interestRate missing]</#if> |
+					status=<#if rate.status??>${rate.status}<#else>[status missing]</#if>
+				</#if>
+			</li>
+		</#list>
+	</#if>
+	</ul>
+</div>
+
+--------------------------------------------------------------------------------
+What each outcome would tell us
+--------------------------------------------------------------------------------
+- "Service located: NO"
+    serviceLocator.findService(...) itself isn't resolving the interface —
+    wrong fully-qualified interface name, module not actually deployed with
+    that package path, or serviceLocator is restricted/unavailable in this
+    execution context (Fragment preview sandbox vs. real page render).
+
+- "Result exists: NO" (but service located OK)
+    findByIsActiveStatusCountryNCategory returned Java null instead of an
+    empty list for this query — a persistence-layer bug worth fixing at the
+    source (the finder should return an empty List, never null).
+
+- "Result size: 0"
+    The query ran fine but nothing matches isActive=true, status="ACTIVE",
+    country="IN", category="NORMAL" — check the seeded data matches those
+    exact values (case-sensitivity on "ACTIVE"/"NORMAL"/"IN" included).
+
+- "rate is NULL" on some index
+    Confirms the underlying List really does contain a null element —
+    a genuine bug in findByIsActiveNStatusNCountryNCategory (or the SQL/
+    finder it delegates to), independent of anything in the fragment's FTL.
+
+- A specific field reported "[xxx missing]" while others show real values
+    rate itself is fine; that one column is null for that row (or the
+    getter name doesn't match what's assumed here) — narrows the fix to
+    that column specifically rather than the whole object.
