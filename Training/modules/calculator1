@@ -1,0 +1,126 @@
+================================================================================
+ Deposit Calculator — isolated debug: raw InterestRateUploadLocalService call
+================================================================================
+Purpose: isolate the service call from all the JSON-building/null-guard logic
+in `calculator` (section 7), to find out exactly where the "rate has
+evaluated to null or missing" error is really coming from. Fully static
+inputs — nothing computed, nothing looped over customerCategories. Every
+single field access is individually guarded with its own <#if x??> so that
+even if one specific property is the actual problem, it gets reported
+instead of crashing the whole render.
+
+Static test values confirmed correct: true, "2", "South Africa", "Normal".
+
+Revision note: the previous version of this file asserted `testRates`
+directly from the method call, then checked `testRates??` on separate
+lines before dereferencing `?size`/`?is_sequence` on it. That still hit
+"testRates has evaluated to null or missing" at the ${testRates?size} call —
+*inside* the <#if testRates??> guard that should have prevented it ever
+running. `??`/`!` only catch a value being null; they cannot catch a Java
+exception being thrown during evaluation, and a guarded expression still
+failing behind its own guard is a strong signal this is a thrown exception
+being surfaced through FreeMarker's generic "null or missing" message
+rather than an actual null value. Applying `!` directly at the point of
+assignment (see rawTestRates/testRates split below) removes the ambiguity
+either way: if the *raw* call still throws, the exception surfaces exactly
+at the <#assign rawTestRates = ...> line instead of somewhere downstream
+behind a guard that looked like it should have worked.
+
+How to use:
+  1. Swap this in as your fragment's index.html content temporarily (in
+     place of the full calculator).
+  2. Publish the fragment and test on an ACTUAL PAGE, not just the Fragment
+     Editor's Draft preview panel — the last screenshot showed this running
+     in the unpublished Draft preview, which may execute FTL in a more
+     restricted context than a real page render (this hasn't been ruled out
+     yet and is now the most likely remaining variable).
+  3. If it still fails, check the server log (SystemOut/catalina.out) for
+     the same timestamp — Liferay typically logs the full Java stack trace
+     for a template-render failure server-side even when the on-screen
+     message is FreeMarker's generic summary. That trace will show the real
+     exception type/cause, which the on-screen FTL error can't.
+  4. Report back exactly what renders: the "Service located"/"Raw result
+     exists"/"Result size" lines, and each <li> row underneath.
+
+--- index.html (temporary, replaces the full calculator while debugging) ---
+<div class="dc-debug">
+	<h3>Debug: Raw Service Call Test</h3>
+
+	<#assign interestRateUploadLocalService = serviceLocator.findService("com.sbi.core.service.service.InterestRateUploadLocalService")>
+	<p>Service located: <#if interestRateUploadLocalService??>YES<#else>NO</#if></p>
+
+	<#-- Raw, unguarded assign on purpose: if the call itself throws, the
+	     error now points exactly here instead of somewhere downstream
+	     behind a guard that looked correct. -->
+	<#assign rawTestRates = interestRateUploadLocalService.findByIsActiveStatusCountryNCategory(true, "2", "South Africa", "Normal")>
+	<p>Raw result exists (not null): <#if rawTestRates??>YES<#else>NO</#if></p>
+
+	<#-- From here on, testRates can never be null — ![] guarantees an
+	     empty sequence instead, so every downstream ?size/?is_sequence/
+	     <#list> below is unconditionally safe regardless of what the raw
+	     call returned. -->
+	<#assign testRates = rawTestRates![]>
+	<p>Result is a sequence: <#if testRates?is_sequence>YES<#else>NO</#if></p>
+	<p>Result size: ${testRates?size}</p>
+
+	<ul>
+		<#list testRates as rate>
+			<li>
+				Index ${rate_index}:
+				<#if !rate??>
+					rate is NULL
+				<#else>
+					rate exists |
+					category=<#if rate.category??>${rate.category}<#else>[category missing]</#if> |
+					interestType=<#if rate.interestType??>${rate.interestType}<#else>[interestType missing]</#if> |
+					interestRate=<#if rate.interestRate??>${rate.interestRate}<#else>[interestRate missing]</#if> |
+					status=<#if rate.status??>${rate.status}<#else>[status missing]</#if>
+				</#if>
+			</li>
+		</#list>
+	</ul>
+</div>
+
+--------------------------------------------------------------------------------
+What each outcome would tell us
+--------------------------------------------------------------------------------
+- "Service located: NO"
+    serviceLocator.findService(...) itself isn't resolving the interface —
+    wrong fully-qualified interface name, module not actually deployed with
+    that package path, or serviceLocator is restricted/unavailable in this
+    execution context (Fragment preview sandbox vs. real page render).
+
+- The error now appears at the <#assign rawTestRates = ...> line itself
+    Confirms this is a thrown Java exception, not a null value — check the
+    server log at this timestamp for the real stack trace. Common causes:
+    a bug in findByIsActiveNStatusNCountryNCategory's underlying SQL/finder,
+    a param-count/type mismatch against what's actually deployed, or the
+    method not existing yet on the deployed LocalService (Service Builder
+    not rerun after adding it).
+
+- "Raw result exists: NO" but no exception thrown
+    findByIsActiveStatusCountryNCategory returned Java null instead of an
+    empty list for this query — a persistence-layer bug worth fixing at the
+    source (the finder should return an empty List, never null). Harmless
+    here since testRates![] catches it, but still worth fixing upstream.
+
+- "Result size: 0"
+    The query ran fine but nothing matches isActive=true, status="2",
+    country="South Africa", category="Normal" — check the seeded data
+    matches those exact values (case-sensitivity included).
+
+- "rate is NULL" on some index
+    Confirms the underlying List really does contain a null element —
+    a genuine bug in findByIsActiveNStatusNCountryNCategory (or the SQL/
+    finder it delegates to), independent of anything in the fragment's FTL.
+
+- A specific field reported "[xxx missing]" while others show real values
+    rate itself is fine; that one column is null for that row (or the
+    getter name doesn't match what's assumed here) — narrows the fix to
+    that column specifically rather than the whole object.
+
+- Everything above renders fine on a published page but failed in the
+  Fragment Editor's Draft preview
+    Confirms the preview sandbox is the actual culprit — treat Draft
+    preview errors on serviceLocator-backed fragments as unreliable going
+    forward and always verify against a published page instead.
