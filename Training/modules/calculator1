@@ -51,7 +51,11 @@ data-dependent null.
 	<#assign userLocalService = serviceLocator.findService("com.liferay.portal.kernel.service.UserLocalService")>
 	<p>Core service located: <#if userLocalService??>YES<#else>NO</#if></p>
 
-	<#assign userCount = userLocalService.getUserCount(themeDisplay.getCompanyId())>
+	<#-- No themeDisplay dependency on purpose: Fragments don't always get
+	     the same globals an ADT does, and getUserCount() has a genuine
+	     no-arg overload (total across all companies) that needs nothing
+	     from the surrounding render context at all. -->
+	<#assign userCount = userLocalService.getUserCount()>
 	<p>User count: ${userCount}</p>
 
 	<hr>
