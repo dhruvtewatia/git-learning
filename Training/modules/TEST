@@ -101,9 +101,9 @@ public Fields getFields(DDMStructure ddmStructure, ProcurementNewsTest data) thr
 			} else if ("TenderDescription".equalsIgnoreCase(ddmFormField.getName())) {
 				val = procurementNewsTest.getTenderDescription();
 			} else if ("EndDate".equalsIgnoreCase(ddmFormField.getName())) {
-				val = procurementNewsTest.getEndDate();
+				val = toDDMDateValue(procurementNewsTest.getEndDate());
 			} else if ("StartDate".equalsIgnoreCase(ddmFormField.getName())) {
-				val = procurementNewsTest.getStartDate();
+				val = toDDMDateValue(procurementNewsTest.getStartDate());
 			}
 
 			else if ("SupportingLinks".equalsIgnoreCase(ddmFormField.getName())) {
@@ -126,4 +126,21 @@ public Fields getFields(DDMStructure ddmStructure, ProcurementNewsTest data) thr
 		ddmFormValues.setDDMFormFieldValues(ddmFormFieldValues);
 
 		return ddmFormValues;
+	}
+
+	private String toDDMDateValue(String sourceDate) {
+
+		if (Validator.isNull(sourceDate)) {
+			return StringPool.BLANK;
+		}
+
+		try {
+			Date date = new SimpleDateFormat("dd-MMMM-yyyy", Locale.US).parse(sourceDate);
+
+			return new SimpleDateFormat("yyyy-MM-dd").format(date);
+		} catch (ParseException pe) {
+			_log.error("Unable to parse date value \"" + sourceDate + "\", expected format dd-MMMM-yyyy", pe);
+
+			return StringPool.BLANK;
+		}
 	}
